@@ -1,0 +1,421 @@
+package repository
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type PostgresRepository struct {
+	pool *pgxpool.Pool
+}
+
+func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
+	return &PostgresRepository{pool: pool}
+}
+
+func (r *PostgresRepository) CreateCampaign(ctx context.Context, campaign *domain.Campaign, targets []*domain.CampaignTarget, outbox []*domain.OutboxMessage) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Insert campaign
+	_, err = tx.Exec(ctx, `
+		INSERT INTO campaigns (id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, total_count)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		campaign.ID, campaign.TenantID, campaign.Name, campaign.MessageTemplate, campaign.Status, campaign.OriginalExcelName, campaign.OriginalExcelPath, campaign.ProcessedExcelPath, campaign.TotalCount)
+	if err != nil {
+		return fmt.Errorf("failed to insert campaign: %w", err)
+	}
+
+	// Bulk insert targets using CopyFrom
+	targetRows := make([][]any, len(targets))
+	for i, t := range targets {
+		targetRows[i] = []any{t.ID, t.CampaignID, t.ClientName, t.PhoneNormalized, t.ExcelRowIndex, t.Status}
+	}
+
+	_, err = tx.CopyFrom(
+		ctx,
+		pgx.Identifier{"campaign_targets"},
+		[]string{"id", "campaign_id", "client_name", "phone_normalized", "excel_row_index", "status"},
+		pgx.CopyFromRows(targetRows),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to bulk insert targets: %w", err)
+	}
+
+	// Bulk insert outbox messages
+	outboxRows := make([][]any, len(outbox))
+	for i, m := range outbox {
+		outboxRows[i] = []any{m.ID, m.EventType, m.Payload, m.Status}
+	}
+
+	_, err = tx.CopyFrom(
+		ctx,
+		pgx.Identifier{"outbox_messages"},
+		[]string{"id", "event_type", "payload", "status"},
+		pgx.CopyFromRows(outboxRows),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to bulk insert outbox: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (r *PostgresRepository) GetCampaign(ctx context.Context, id uuid.UUID) (*domain.Campaign, error) {
+	var c domain.Campaign
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, deleted, processed_count, total_count, error_count, created_at, updated_at
+		FROM campaigns WHERE id = $1`, id).Scan(
+		&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.Deleted, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (r *PostgresRepository) ListCampaigns(ctx context.Context, tenantID uuid.UUID) ([]*domain.Campaign, error) {
+	log.Printf("ListCampaigns called for tenant: %v", tenantID)
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, deleted, processed_count, total_count, error_count, created_at, updated_at
+		FROM campaigns WHERE tenant_id = $1 AND deleted = FALSE ORDER BY created_at DESC`, tenantID)
+	if err != nil {
+		log.Printf("ListCampaigns query error: %v", err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	var campaigns []*domain.Campaign
+	for rows.Next() {
+		var c domain.Campaign
+		err := rows.Scan(&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.Deleted, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt)
+		if err != nil {
+			log.Printf("ListCampaigns scan error: %v", err)
+			return nil, err
+		}
+		log.Printf("ListCampaigns found campaign: %v, status: %v, deleted: %v", c.ID, c.Status, c.Deleted)
+		campaigns = append(campaigns, &c)
+	}
+	log.Printf("ListCampaigns returning %d campaigns", len(campaigns))
+	return campaigns, nil
+}
+
+func (r *PostgresRepository) UpdateCampaignStatus(ctx context.Context, id uuid.UUID, status domain.CampaignStatus) error {
+	_, err := r.pool.Exec(ctx, "UPDATE campaigns SET status = $1, updated_at = NOW() WHERE id = $2", status, id)
+	return err
+}
+
+func (r *PostgresRepository) GetCampaignTargets(ctx context.Context, campaignID uuid.UUID) ([]*domain.CampaignTarget, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, campaign_id, client_name, phone_normalized, excel_row_index, status, last_error, sent_at, replied_at, last_reply_text, created_at, updated_at
+		FROM campaign_targets WHERE campaign_id = $1 ORDER BY excel_row_index ASC`, campaignID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var targets []*domain.CampaignTarget
+	for rows.Next() {
+		var t domain.CampaignTarget
+		err := rows.Scan(&t.ID, &t.CampaignID, &t.ClientName, &t.PhoneNormalized, &t.ExcelRowIndex, &t.Status, &t.LastError, &t.SentAt, &t.RepliedAt, &t.LastReplyText, &t.CreatedAt, &t.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, &t)
+	}
+	return targets, nil
+}
+
+func (r *PostgresRepository) GetCampaignsByStatus(ctx context.Context, status domain.CampaignStatus) ([]*domain.Campaign, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, deleted, processed_count, total_count, error_count, created_at, updated_at
+		FROM campaigns WHERE status = $1 AND deleted = false`, status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var campaigns []*domain.Campaign
+	for rows.Next() {
+		var c domain.Campaign
+		err := rows.Scan(&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.Deleted, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		campaigns = append(campaigns, &c)
+	}
+	return campaigns, nil
+}
+
+func (r *PostgresRepository) GetTargetsByStatus(ctx context.Context, campaignID uuid.UUID, status domain.TaskStatus) ([]*domain.CampaignTarget, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, campaign_id, client_name, phone_normalized, excel_row_index, status, last_error, sent_at, replied_at, last_reply_text, created_at, updated_at
+		FROM campaign_targets WHERE campaign_id = $1 AND status = $2`, campaignID, status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var targets []*domain.CampaignTarget
+	for rows.Next() {
+		var t domain.CampaignTarget
+		err := rows.Scan(&t.ID, &t.CampaignID, &t.ClientName, &t.PhoneNormalized, &t.ExcelRowIndex, &t.Status, &t.LastError, &t.SentAt, &t.RepliedAt, &t.LastReplyText, &t.CreatedAt, &t.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, &t)
+	}
+	return targets, nil
+}
+
+func (r *PostgresRepository) GetPendingMessages(ctx context.Context, limit int) ([]*domain.OutboxMessage, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, event_type, payload, status, created_at
+		FROM outbox_messages 
+		WHERE status = 'pending' 
+		FOR UPDATE SKIP LOCKED 
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []*domain.OutboxMessage
+	for rows.Next() {
+		var m domain.OutboxMessage
+		err := rows.Scan(&m.ID, &m.EventType, &m.Payload, &m.Status, &m.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, &m)
+	}
+	return messages, nil
+}
+
+func (r *PostgresRepository) MarkAsProcessed(ctx context.Context, id uuid.UUID) error {
+	_, err := r.pool.Exec(ctx, "UPDATE outbox_messages SET status = 'processed', processed_at = NOW() WHERE id = $1", id)
+	return err
+}
+
+func (r *PostgresRepository) UpdateTargetStatus(ctx context.Context, targetID uuid.UUID, status domain.TaskStatus, lastError *string, sentAt *time.Time) (*domain.Campaign, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	var campaignID uuid.UUID
+	var oldStatus domain.TaskStatus
+	
+	// Determine sent_at value: use provided if available, otherwise use NOW() for 'delivered'
+	var finalSentAt *time.Time
+	if sentAt != nil {
+		finalSentAt = sentAt
+	} else if status == domain.TaskStatusDelivered {
+		now := time.Now()
+		finalSentAt = &now
+	}
+
+	err = tx.QueryRow(ctx, "UPDATE campaign_targets SET status = $1, last_error = $2, sent_at = COALESCE($3, sent_at), updated_at = NOW() WHERE id = $4 RETURNING campaign_id, status",
+		status, lastError, finalSentAt, targetID).Scan(&campaignID, &oldStatus)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update campaign counters
+	var query string
+	if status == domain.TaskStatusDelivered {
+		query = "UPDATE campaigns SET processed_count = processed_count + 1, updated_at = NOW() WHERE id = $1 RETURNING id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, deleted"
+	} else if status == domain.TaskStatusFailed {
+		query = "UPDATE campaigns SET error_count = error_count + 1, updated_at = NOW() WHERE id = $1 RETURNING id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, deleted"
+	} else {
+		// Just return campaign
+		query = "SELECT id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, deleted FROM campaigns WHERE id = $1"
+	}
+
+	var c domain.Campaign
+	err = tx.QueryRow(ctx, query, campaignID).Scan(
+		&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.Deleted)
+	if err != nil {
+		return nil, err
+	}
+
+	return &c, tx.Commit(ctx)
+}
+
+func (r *PostgresRepository) UpdateCampaign(ctx context.Context, campaign *domain.Campaign) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE campaigns 
+		SET name = $1, message_template = $2, status = $3, original_excel_path = $4, processed_excel_path = $5, deleted = $6, processed_count = $7, total_count = $8, error_count = $9, updated_at = NOW()
+		WHERE id = $10`,
+		campaign.Name, campaign.MessageTemplate, campaign.Status, campaign.OriginalExcelPath, campaign.ProcessedExcelPath, campaign.Deleted, campaign.ProcessedCount, campaign.TotalCount, campaign.ErrorCount, campaign.ID)
+	return err
+}
+
+func (r *PostgresRepository) GetCampaignTargetsWithStatus(ctx context.Context, campaignID uuid.UUID, statuses []domain.TaskStatus) ([]*domain.CampaignTarget, error) {
+	placeholders := make([]string, len(statuses))
+	args := make([]interface{}, len(statuses)+1)
+	args[0] = campaignID
+	for i, status := range statuses {
+		placeholders[i] = fmt.Sprintf("$%d", i+2)
+		args[i+1] = status
+	}
+
+	query := fmt.Sprintf(`
+		SELECT id, campaign_id, client_name, phone_normalized, excel_row_index, status, last_error, sent_at, replied_at, last_reply_text, created_at, updated_at
+		FROM campaign_targets 
+		WHERE campaign_id = $1 AND status IN (%s)`, strings.Join(placeholders, ","))
+
+	rows, err := r.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var targets []*domain.CampaignTarget
+	for rows.Next() {
+		var t domain.CampaignTarget
+		err := rows.Scan(&t.ID, &t.CampaignID, &t.ClientName, &t.PhoneNormalized, &t.ExcelRowIndex, &t.Status, &t.LastError, &t.SentAt, &t.RepliedAt, &t.LastReplyText, &t.CreatedAt, &t.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, &t)
+	}
+	return targets, nil
+}
+
+func (r *PostgresRepository) CreateReply(ctx context.Context, reply *domain.CampaignReply) error {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO campaign_replies (id, campaign_target_id, message_text, received_at)
+		VALUES ($1, $2, $3, $4)
+	`, reply.ID, reply.CampaignTargetID, reply.MessageText, reply.ReceivedAt)
+	return err
+}
+
+func (r *PostgresRepository) GetTenantByID(ctx context.Context, tenantID uuid.UUID) (*domain.Tenant, error) {
+	var t domain.Tenant
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, name, type, COALESCE(admin_phone, ''), admin_messenger, keycloak_group_id, created_at, updated_at
+		FROM tenants
+		WHERE id = $1
+	`, tenantID).Scan(
+		&t.ID, &t.Name, &t.Type, &t.AdminPhone, &t.AdminMessenger, &t.KeycloakGroupID, &t.CreatedAt, &t.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+func (r *PostgresRepository) GetCampaignTargetByID(ctx context.Context, targetID uuid.UUID) (*domain.CampaignTarget, error) {
+	var t domain.CampaignTarget
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, campaign_id, client_name, phone_normalized, excel_row_index, status,
+			last_error, sent_at, replied_at, last_reply_text, created_at, updated_at
+		FROM campaign_targets
+		WHERE id = $1
+	`, targetID).Scan(
+		&t.ID, &t.CampaignID, &t.ClientName, &t.PhoneNormalized, &t.ExcelRowIndex,
+		&t.Status, &t.LastError, &t.SentAt, &t.RepliedAt, &t.LastReplyText, &t.CreatedAt, &t.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+func (r *PostgresRepository) GetRepliesByCampaign(ctx context.Context, campaignID uuid.UUID) ([]*domain.CampaignReply, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT r.id, r.campaign_target_id, r.message_text, r.received_at, r.created_at, r.updated_at
+		FROM campaign_replies r
+		JOIN campaign_targets t ON r.campaign_target_id = t.id
+		WHERE t.campaign_id = $1`, campaignID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var replies []*domain.CampaignReply
+	for rows.Next() {
+		var r domain.CampaignReply
+		err := rows.Scan(&r.ID, &r.CampaignTargetID, &r.MessageText, &r.ReceivedAt, &r.CreatedAt, &r.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		replies = append(replies, &r)
+	}
+	return replies, nil
+}
+
+func (r *PostgresRepository) RegisterReply(ctx context.Context, campaignID uuid.UUID, phone string, text string, repliedAt time.Time) (*domain.Campaign, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	// Find target by campaign and phone
+	var targetID uuid.UUID
+	var oldStatus domain.TaskStatus
+	err = tx.QueryRow(ctx, "UPDATE campaign_targets SET status = $1, last_reply_text = $2, replied_at = $3, updated_at = NOW() WHERE campaign_id = $4 AND phone_normalized = $5 RETURNING id, status",
+		domain.TaskStatusReplied, text, repliedAt, campaignID, phone).Scan(&targetID, &oldStatus)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create reply record
+	replyID, err := uuid.NewV7()
+	if err != nil {
+		replyID = uuid.New()
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO campaign_replies (id, campaign_target_id, message_text, received_at)
+		VALUES ($1, $2, $3, $4)`,
+		replyID, targetID, text, repliedAt)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get updated campaign
+	var c domain.Campaign
+	err = tx.QueryRow(ctx, `
+		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, deleted, processed_count, total_count, error_count, created_at, updated_at
+		FROM campaigns WHERE id = $1`, campaignID).Scan(
+		&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.Deleted, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if all targets have replied
+	var totalTargets int
+	var repliedTargets int
+	err = tx.QueryRow(ctx, `
+		SELECT 
+			COUNT(*) as total,
+			SUM(CASE WHEN status = 'replied' THEN 1 ELSE 0 END) as replied
+		FROM campaign_targets WHERE campaign_id = $1`, campaignID).Scan(&totalTargets, &repliedTargets)
+	if err != nil {
+		return nil, err
+	}
+
+	// If all replied, mark campaign as completed
+	if repliedTargets >= totalTargets {
+		_, err = tx.Exec(ctx, `UPDATE campaigns SET status = 'completed', updated_at = NOW() WHERE id = $1`, campaignID)
+		if err != nil {
+			return nil, err
+		}
+		c.Status = domain.CampaignStatusCompleted
+	}
+
+	return &c, tx.Commit(ctx)
+}
