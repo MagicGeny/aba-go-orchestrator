@@ -246,9 +246,12 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 	for target := range results {
 		targets = append(targets, target)
 
+		// Replace {user} in message template
+		messageText := strings.ReplaceAll(campaign.MessageTemplate, "{user}", target.ClientName)
+
 		// Create outbox message for each target
-		payload := fmt.Sprintf(`{"task_id":"%s", "campaign_id":"%s", "messenger":"max", "phone":"%s", "message_text":"%s"}`,
-			target.ID, campaign.ID, target.PhoneNormalized, campaign.MessageTemplate) // Simplification, template should be parsed
+		payload := fmt.Sprintf(`{"task_id":"%s", "campaign_id":"%s", "messenger":"max", "phone":"%s", "message_text":%q}`,
+			target.ID, campaign.ID, target.PhoneNormalized, messageText)
 
 		outboxID, err := uuid.NewV7()
 		if err != nil {
@@ -328,7 +331,7 @@ func normalizePhone(p string) string {
 // GenerateExcel creates or updates an Excel file with current campaign status
 func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UUID) (string, error) {
 	log.Printf("GenerateExcel: Starting for campaign %s", campaignID)
-	
+
 	// Get campaign and targets
 	campaign, err := uc.repo.GetCampaign(ctx, campaignID)
 	if err != nil {
@@ -443,12 +446,19 @@ func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UU
 			if target.LastError != nil && target.Status == domain.TaskStatusFailed {
 				statusText = fmt.Sprintf("%s: %s", statusText, *target.LastError)
 			}
-			if target.LastReplyText != nil {
-				replyText = *target.LastReplyText
-				log.Printf("GenerateExcel: Row %d - setting reply text to: %s", rowNum, replyText)
-			}
-			if target.RepliedAt != nil {
-				replyTimeText = target.RepliedAt.Format("2006-01-02 15:04:05")
+
+			if target.Status == domain.TaskStatusReplied {
+				if target.LastReplyText != nil {
+					replyText = *target.LastReplyText
+					log.Printf("GenerateExcel: Row %d - setting reply text to: %s", rowNum, replyText)
+				}
+				if target.RepliedAt != nil {
+					replyTimeText = target.RepliedAt.Format("2006-01-02 15:04:05")
+				}
+			} else if target.Status == domain.TaskStatusViewed {
+				replyText = "ПРОЧИТАНО"
+				// For viewed, use the last updated time as the time
+				replyTimeText = target.UpdatedAt.Format("2006-01-02 15:04:05")
 			}
 		}
 

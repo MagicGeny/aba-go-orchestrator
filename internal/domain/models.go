@@ -34,6 +34,7 @@ const (
 	TaskStatusPending   TaskStatus = "pending"
 	TaskStatusSent      TaskStatus = "sent"
 	TaskStatusDelivered TaskStatus = "delivered"
+	TaskStatusViewed    TaskStatus = "viewed"
 	TaskStatusFailed    TaskStatus = "failed"
 	TaskStatusReplied   TaskStatus = "replied"
 )
@@ -47,6 +48,8 @@ func (s TaskStatus) StatusText() string {
 		return "Отправлено"
 	case TaskStatusDelivered:
 		return "Доставлено"
+	case TaskStatusViewed:
+		return "Просмотрено"
 	case TaskStatusFailed:
 		return "Ошибка"
 	case TaskStatusReplied:
@@ -57,14 +60,14 @@ func (s TaskStatus) StatusText() string {
 }
 
 type Tenant struct {
-	ID                uuid.UUID  `json:"id"`
-	Name              string     `json:"name"`
-	Type              TenantType `json:"type"`
-	AdminPhone        string     `json:"admin_phone"`
-	AdminMessenger    string     `json:"admin_messenger"`
-	KeycloakGroupID   *string    `json:"keycloak_group_id,omitempty"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
+	ID              uuid.UUID  `json:"id"`
+	Name            string     `json:"name"`
+	Type            TenantType `json:"type"`
+	AdminPhone      string     `json:"admin_phone"`
+	AdminMessenger  string     `json:"admin_messenger"`
+	KeycloakGroupID *string    `json:"keycloak_group_id,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 type Campaign struct {
@@ -135,7 +138,7 @@ type ClientReplyInfo struct {
 }
 
 type TenantAdminNotificationTask struct {
-	TenantPhone string           `json:"tenant_phone"`
+	TenantPhone string            `json:"tenant_phone"`
 	Replies     []ClientReplyInfo `json:"replies"`
 }
 

@@ -14,28 +14,28 @@ import (
 )
 
 const (
-	batchSize      = 5
-	flushInterval  = 55 * time.Second
+	batchSize     = 1
+	flushInterval = 55 * time.Second
 )
 
 type ResultConsumer struct {
-	repo       domain.CampaignRepository
-	uc         *usecase.CampaignUseCase
-	amqpConn   *amqp091.Connection
-	amqpChan   *amqp091.Channel // Added back amqpChan
-	queueName  string
-	mu         sync.Mutex
-	isRunning  bool
-	results    []domain.TargetResult
-	stopChan   chan struct{}
-	wg         sync.WaitGroup
+	repo      domain.CampaignRepository
+	uc        *usecase.CampaignUseCase
+	amqpConn  *amqp091.Connection
+	amqpChan  *amqp091.Channel // Added back amqpChan
+	queueName string
+	mu        sync.Mutex
+	isRunning bool
+	results   []domain.TargetResult
+	stopChan  chan struct{}
+	wg        sync.WaitGroup
 }
 
 func NewResultConsumer(repo domain.CampaignRepository, uc *usecase.CampaignUseCase, amqpConn *amqp091.Connection, queueName string) (*ResultConsumer, error) {
 	rc := &ResultConsumer{
 		repo:      repo,
 		uc:        uc,
-		amqpConn: amqpConn,
+		amqpConn:  amqpConn,
 		queueName: queueName,
 	}
 	err := rc.reconnect()
@@ -144,6 +144,8 @@ func (rc *ResultConsumer) Run(ctx context.Context) error {
 				continue
 			}
 
+			log.Printf("ResultConsumer: received message body: %s", string(msg.Body))
+
 			var result domain.TargetResult
 			err := json.Unmarshal(msg.Body, &result)
 			if err != nil {
@@ -212,7 +214,7 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 
 		log.Printf("ResultConsumer: processing result for target %s, status: %s, reply: %v", result.TargetID, result.Status, result.ReplyText)
 
-		if result.ReplyText != nil && result.Status == "replied" {
+		if result.ReplyText != nil && result.Status == domain.TaskStatusReplied {
 			// First, register the reply in DB
 			campaign, err := rc.repo.RegisterReply(processCtx, result.CampaignID, result.PhoneNumber, *result.ReplyText, result.Timestamp)
 			if err != nil {
@@ -236,6 +238,14 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				Message:   *result.ReplyText,
 				Time:      result.Timestamp,
 			})
+		} else if result.Status == domain.TaskStatusViewed {
+			// Handle "viewed" status - update target status and record viewed time
+			_, err := rc.repo.UpdateTargetStatus(processCtx, result.TargetID, domain.TaskStatus(result.Status), nil, nil)
+			if err != nil {
+				log.Printf("ResultConsumer: failed to update target %s status to %s: %v", result.TargetID, result.Status, err)
+			} else {
+				uniqueCampaignIDs[result.CampaignID] = struct{}{}
+			}
 		} else if result.Status != "" {
 			_, err := rc.repo.UpdateTargetStatus(processCtx, result.TargetID, domain.TaskStatus(result.Status), nil, nil)
 			if err != nil {
@@ -306,10 +316,10 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 
 		err = rc.amqpChan.PublishWithContext(
 			publishCtx,
-			"",                                  // exchange
+			"",                                   // exchange
 			"tasks.messages.tenant_admin_notify", // routing key
-			false,                               // mandatory
-			false,                               // immediate
+			false,                                // mandatory
+			false,                                // immediate
 			amqp091.Publishing{
 				ContentType: "application/json",
 				Body:        payload,

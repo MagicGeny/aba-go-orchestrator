@@ -13,12 +13,12 @@ import (
 )
 
 type ReplyPoller struct {
-	repo       domain.CampaignRepository
-	amqpConn   *amqp091.Connection
-	amqpChan   *amqp091.Channel
-	queueName  string
-	mu         sync.Mutex
-	isRunning  bool
+	repo      domain.CampaignRepository
+	amqpConn  *amqp091.Connection
+	amqpChan  *amqp091.Channel
+	queueName string
+	mu        sync.Mutex
+	isRunning bool
 }
 
 func NewReplyPoller(repo domain.CampaignRepository, amqpConn *amqp091.Connection, queueName string) (*ReplyPoller, error) {
@@ -125,11 +125,12 @@ func (p *ReplyPoller) PollActiveCampaigns(_ context.Context) {
 			continue
 		}
 
-		// Get targets that haven't replied yet (status is pending, sent, or delivered but not replied)
+		// Get targets that haven't replied yet (status is pending, sent, delivered, or viewed)
 		targets, err := p.repo.GetCampaignTargetsWithStatus(ctx, c.ID, []domain.TaskStatus{
 			domain.TaskStatusPending,
 			domain.TaskStatusSent,
 			domain.TaskStatusDelivered,
+			domain.TaskStatusViewed,
 		})
 		if err != nil {
 			log.Printf("ReplyPoller: failed to get targets for campaign %s: %v", c.ID, err)

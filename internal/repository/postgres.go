@@ -216,12 +216,12 @@ func (r *PostgresRepository) UpdateTargetStatus(ctx context.Context, targetID uu
 
 	var campaignID uuid.UUID
 	var oldStatus domain.TaskStatus
-	
-	// Determine sent_at value: use provided if available, otherwise use NOW() for 'delivered'
+
+	// Determine sent_at value: use provided if available, otherwise use NOW() for 'delivered' or 'sent'
 	var finalSentAt *time.Time
 	if sentAt != nil {
 		finalSentAt = sentAt
-	} else if status == domain.TaskStatusDelivered {
+	} else if status == domain.TaskStatusDelivered || status == domain.TaskStatusSent {
 		now := time.Now()
 		finalSentAt = &now
 	}
