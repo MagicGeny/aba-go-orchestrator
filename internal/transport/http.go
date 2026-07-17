@@ -17,9 +17,9 @@ import (
 )
 
 type HTTPHandler struct {
-	campaignUC   *usecase.CampaignUseCase
-	hub          *Hub
-	replyPoller  *worker.ReplyPoller
+	campaignUC  *usecase.CampaignUseCase
+	hub         *Hub
+	replyPoller *worker.ReplyPoller
 }
 
 func NewHTTPHandler(campaignUC *usecase.CampaignUseCase, hub *Hub, replyPoller *worker.ReplyPoller) *HTTPHandler {
@@ -47,6 +47,21 @@ func (h *HTTPHandler) UploadCampaign(w http.ResponseWriter, r *http.Request) {
 	name := r.FormValue("name")
 	template := r.FormValue("template")
 
+	startImmediatelyStr := r.FormValue("start_immediately")
+	startImmediately := true
+	if startImmediatelyStr == "false" {
+		startImmediately = false
+	}
+
+	var timeToStart *time.Time
+	timeToStartStr := r.FormValue("time_to_start")
+	if timeToStartStr != "" {
+		t, err := time.Parse(time.RFC3339, timeToStartStr)
+		if err == nil {
+			timeToStart = &t
+		}
+	}
+
 	file, header, err := r.FormFile("excel")
 	if err != nil {
 		http.Error(w, "excel file is required", http.StatusBadRequest)
@@ -58,7 +73,7 @@ func (h *HTTPHandler) UploadCampaign(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	campaignID, err := h.campaignUC.UploadCampaign(ctx, tenantID, name, template, file, header.Filename)
+	campaignID, err := h.campaignUC.UploadCampaign(ctx, tenantID, name, template, startImmediately, timeToStart, file, header.Filename)
 	if err != nil {
 		log.Printf("UploadCampaign error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -67,6 +82,39 @@ func (h *HTTPHandler) UploadCampaign(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"id": campaignID})
+}
+
+func (h *HTTPHandler) StopCampaign(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	campaignIDStr := r.URL.Query().Get("campaign_id")
+	if campaignIDStr == "" {
+		http.Error(w, "campaign_id is required", http.StatusBadRequest)
+		return
+	}
+
+	campaignID, err := uuid.Parse(campaignIDStr)
+	if err != nil {
+		http.Error(w, "invalid campaign_id", http.StatusBadRequest)
+		return
+	}
+
+	// Create independent context
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	err = h.campaignUC.StopCampaign(ctx, campaignID)
+	if err != nil {
+		log.Printf("StopCampaign error: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 }
 
 func (h *HTTPHandler) WorkerCallback(w http.ResponseWriter, r *http.Request) {

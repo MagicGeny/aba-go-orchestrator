@@ -26,6 +26,7 @@ const (
 	CampaignStatusCompleted  CampaignStatus = "completed"
 	CampaignStatusPaused     CampaignStatus = "paused"
 	CampaignStatusFailed     CampaignStatus = "failed"
+	CampaignStatusStopped    CampaignStatus = "stopped"
 )
 
 type TaskStatus string
@@ -80,6 +81,8 @@ type Campaign struct {
 	OriginalExcelPath  *string        `json:"-"` // Don't serialize to JSON
 	ProcessedExcelPath *string        `json:"-"` // Don't serialize to JSON
 	Deleted            bool           `json:"deleted"`
+	StartImmediately   bool           `json:"start_immediately"`
+	TimeToStart        *time.Time     `json:"time_to_start"`
 	ProcessedCount     int            `json:"processed_count"`
 	TotalCount         int            `json:"total_count"`
 	ErrorCount         int            `json:"error_count"`
@@ -158,6 +161,8 @@ type CampaignRepository interface {
 	GetRepliesByCampaign(ctx context.Context, campaignID uuid.UUID) ([]*CampaignReply, error)
 	GetTenantByID(ctx context.Context, tenantID uuid.UUID) (*Tenant, error)
 	GetCampaignTargetByID(ctx context.Context, targetID uuid.UUID) (*CampaignTarget, error)
+	GetActiveCampaignsReadyToStart(ctx context.Context) ([]*Campaign, error)
+	StopCampaign(ctx context.Context, campaignID uuid.UUID) error
 }
 
 type OutboxRepository interface {

@@ -37,6 +37,14 @@ func (uc *CampaignUseCase) ListCampaigns(ctx context.Context, tenantID uuid.UUID
 	return uc.repo.ListCampaigns(ctx, tenantID)
 }
 
+func (uc *CampaignUseCase) GetActiveCampaignsReadyToStart(ctx context.Context) ([]*domain.Campaign, error) {
+	return uc.repo.GetActiveCampaignsReadyToStart(ctx)
+}
+
+func (uc *CampaignUseCase) StopCampaign(ctx context.Context, id uuid.UUID) error {
+	return uc.repo.StopCampaign(ctx, id)
+}
+
 func (uc *CampaignUseCase) UpdateTargetStatus(ctx context.Context, targetID uuid.UUID, status domain.TaskStatus, lastError string, sentAt *time.Time) (*domain.Campaign, error) {
 	var errPtr *string
 	if lastError != "" {
@@ -103,7 +111,7 @@ func generateSemanticFilename(campaignName string, createdAt time.Time, original
 		originalExt)
 }
 
-func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUID, name, template string, excelReader io.Reader, originalName string) (uuid.UUID, error) {
+func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUID, name, template string, startImmediately bool, timeToStart *time.Time, excelReader io.Reader, originalName string) (uuid.UUID, error) {
 	// Ensure upload directory exists
 	if err := os.MkdirAll(uploadDir, 0755); err != nil {
 		return uuid.Nil, fmt.Errorf("failed to create upload directory: %w", err)
@@ -157,16 +165,26 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 		return uuid.Nil, fmt.Errorf("failed to save original file: %w", err)
 	}
 
+	// Set initial status based on start_immediately flag
+	// If startImmediately is true, the campaign starts right away.
+	// If false, it stays in draft and will be picked up by the poller when time_to_start arrives.
+	status := domain.CampaignStatusDraft
+	if startImmediately {
+		status = domain.CampaignStatusProcessing
+	}
+
 	campaign := &domain.Campaign{
 		ID:                 campaignID,
 		TenantID:           tenantID,
 		Name:               name,
 		MessageTemplate:    template,
-		Status:             domain.CampaignStatusProcessing,
+		Status:             status,
 		OriginalExcelName:  originalName,
 		OriginalExcelPath:  &originalFilePath,
 		ProcessedExcelPath: nil, // Will be generated later
 		Deleted:            false,
+		StartImmediately:   startImmediately,
+		TimeToStart:        timeToStart,
 		CreatedAt:          createdAt,
 		UpdatedAt:          createdAt,
 	}
@@ -247,7 +265,7 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 		targets = append(targets, target)
 
 		// Replace {user} in message template
-		messageText := strings.ReplaceAll(campaign.MessageTemplate, "{user}", target.ClientName)
+		messageText := strings.ReplaceAll(campaign.MessageTemplate, "{user_name}", target.ClientName)
 
 		// Create outbox message for each target
 		payload := fmt.Sprintf(`{"task_id":"%s", "campaign_id":"%s", "messenger":"max", "phone":"%s", "message_text":%q}`,

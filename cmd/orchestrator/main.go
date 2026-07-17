@@ -15,8 +15,8 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/rabbitmq/amqp091-go" // Пакет для RabbitMQ без дефисов в коде
 	"github.com/joho/godotenv"
+	"github.com/rabbitmq/amqp091-go" // Пакет для RabbitMQ без дефисов в коде
 
 	// ПОДКЛЮЧАЕМ ТВОИ ВНУТРЕННИЕ ПАКЕТЫ (MagicGeny):
 	"github.com/MagicGeny/aba-go-orchestrator/internal/repository"
@@ -44,7 +44,6 @@ func main() {
 	// 1.1 AUTO MIGRATIONS
 	log.Println("Running database migrations...")
 	runMigrations(dbURL)
-
 
 	// 2. Connect to RabbitMQ
 	amqpURL := os.Getenv("RABBITMQ_URL")
@@ -96,6 +95,7 @@ func main() {
 	mux.HandleFunc("/api/v1/workers/callback", handler.WorkerCallback)
 	mux.HandleFunc("/api/v1/workers/replies-webhook", handler.RepliesWebhook)
 	mux.HandleFunc("/api/v1/campaigns/download", handler.DownloadCampaign)
+	mux.HandleFunc("/api/v1/campaigns/stop", handler.StopCampaign)
 
 	// Add CORS middleware
 	corsMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -165,6 +165,6 @@ func runMigrations(dbURL string) {
 }
 
 /*"github.com/aba/orchestrator/internal/repository"
-	"github.com/aba/orchestrator/internal/transport"
-	"github.com/aba/orchestrator/internal/usecase"
-	"github.com/aba/orchestrator/internal/worker"*/
+"github.com/aba/orchestrator/internal/transport"
+"github.com/aba/orchestrator/internal/usecase"
+"github.com/aba/orchestrator/internal/worker"*/

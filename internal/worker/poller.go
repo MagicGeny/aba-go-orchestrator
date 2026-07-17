@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"github.com/google/uuid"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -107,14 +108,25 @@ func (p *ReplyPoller) PollActiveCampaigns(_ context.Context) {
 
 	log.Println("ReplyPoller: Checking for active campaigns to poll...")
 
-	// Get campaigns in processing status only
-	processingCampaigns, err := p.repo.GetCampaignsByStatus(ctx, domain.CampaignStatusProcessing)
+	// Get campaigns that are ready to start (draft/processing with start_immediately=true or time_to_start passed)
+	readyCampaigns, err := p.repo.GetActiveCampaignsReadyToStart(ctx)
 	if err != nil {
-		log.Printf("ReplyPoller: failed to get processing campaigns: %v", err)
+		ч
+		log.Printf("ReplyPoller: failed to get ready campaigns: %v", err)
 		return
 	}
 
-	for _, c := range processingCampaigns {
+	for _, c := range readyCampaigns {
+		// If campaign is draft, mark it as processing now
+		if c.Status == domain.CampaignStatusDraft {
+			log.Printf("ReplyPoller: Starting campaign %s", c.ID)
+			err := p.repo.UpdateCampaignStatus(ctx, c.ID, domain.CampaignStatusProcessing)
+			if err != nil {
+				log.Printf("ReplyPoller: failed to start campaign %s: %v", c.ID, err)
+				continue
+			}
+		}
+
 		// Check if 24 hours have passed since campaign creation
 		if time.Since(c.CreatedAt) > 24*time.Hour {
 			log.Printf("ReplyPoller: Campaign %s has been running for 24h, marking as completed", c.ID)
@@ -141,13 +153,14 @@ func (p *ReplyPoller) PollActiveCampaigns(_ context.Context) {
 			continue
 		}
 
-		// Chunk targets into groups of max 5
+		// Chunk targets into groups of max 50 for queue publishing
 		type ChunkTarget struct {
 			TargetID        uuid.UUID `json:"target_id"`
 			PhoneNormalized string    `json:"phone_normalized"`
+			Message         string    `json:"message"`
 		}
 		var chunks [][]ChunkTarget
-		chunkSize := 5
+		chunkSize := 50
 		for i := 0; i < len(targets); i += chunkSize {
 			end := i + chunkSize
 			if end > len(targets) {
@@ -155,9 +168,12 @@ func (p *ReplyPoller) PollActiveCampaigns(_ context.Context) {
 			}
 			var chunk []ChunkTarget
 			for _, t := range targets[i:end] {
+				// Apply template engine: replace {user_name} with actual client name
+				message := strings.ReplaceAll(c.MessageTemplate, "{user_name}", t.ClientName)
 				chunk = append(chunk, ChunkTarget{
 					TargetID:        t.ID,
 					PhoneNormalized: t.PhoneNormalized,
+					Message:         message,
 				})
 			}
 			chunks = append(chunks, chunk)
