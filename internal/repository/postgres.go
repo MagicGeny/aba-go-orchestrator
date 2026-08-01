@@ -111,7 +111,8 @@ func (r *PostgresRepository) ListCampaigns(ctx context.Context, tenantID uuid.UU
 }
 
 func (r *PostgresRepository) UpdateCampaignStatus(ctx context.Context, id uuid.UUID, status domain.CampaignStatus) error {
-	_, err := r.pool.Exec(ctx, "UPDATE campaigns SET status = $1, updated_at = NOW() WHERE id = $2", status, id)
+	now := time.Now().UTC()
+	_, err := r.pool.Exec(ctx, "UPDATE campaigns SET status = $1, updated_at = $2 WHERE id = $3", status, now, id)
 	return err
 }
 
@@ -203,7 +204,8 @@ func (r *PostgresRepository) GetPendingMessages(ctx context.Context, limit int) 
 }
 
 func (r *PostgresRepository) MarkAsProcessed(ctx context.Context, id uuid.UUID) error {
-	_, err := r.pool.Exec(ctx, "UPDATE outbox_messages SET status = 'processed', processed_at = NOW() WHERE id = $1", id)
+	now := time.Now().UTC()
+	_, err := r.pool.Exec(ctx, "UPDATE outbox_messages SET status = 'processed', processed_at = $1 WHERE id = $2", now, id)
 	return err
 }
 
@@ -217,34 +219,39 @@ func (r *PostgresRepository) UpdateTargetStatus(ctx context.Context, targetID uu
 	var campaignID uuid.UUID
 	var oldStatus domain.TaskStatus
 
-	// Determine sent_at value: use provided if available, otherwise use NOW() for 'delivered' or 'sent'
+	// Determine sent_at value: use provided if available, otherwise use UTC now for 'delivered' or 'sent'
 	var finalSentAt *time.Time
 	if sentAt != nil {
 		finalSentAt = sentAt
 	} else if status == domain.TaskStatusDelivered || status == domain.TaskStatusSent {
-		now := time.Now()
+		now := time.Now().UTC()
 		finalSentAt = &now
 	}
 
-	err = tx.QueryRow(ctx, "UPDATE campaign_targets SET status = $1, last_error = $2, sent_at = COALESCE($3, sent_at), updated_at = NOW() WHERE id = $4 RETURNING campaign_id, status",
-		status, lastError, finalSentAt, targetID).Scan(&campaignID, &oldStatus)
+	now := time.Now().UTC()
+	err = tx.QueryRow(ctx, "UPDATE campaign_targets SET status = $1, last_error = $2, sent_at = COALESCE($3, sent_at), updated_at = $4 WHERE id = $5 RETURNING campaign_id, status",
+		status, lastError, finalSentAt, now, targetID).Scan(&campaignID, &oldStatus)
 	if err != nil {
 		return nil, err
 	}
 
 	// Update campaign counters
 	var query string
+	var args []interface{}
 	if status == domain.TaskStatusDelivered {
-		query = "UPDATE campaigns SET processed_count = processed_count + 1, updated_at = NOW() WHERE id = $1 RETURNING id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, deleted, start_immediately, time_to_start"
+		query = "UPDATE campaigns SET processed_count = processed_count + 1, updated_at = $1 WHERE id = $2 RETURNING id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, deleted, start_immediately, time_to_start"
+		args = []interface{}{now, campaignID}
 	} else if status == domain.TaskStatusFailed {
-		query = "UPDATE campaigns SET error_count = error_count + 1, updated_at = NOW() WHERE id = $1 RETURNING id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, deleted, start_immediately, time_to_start"
+		query = "UPDATE campaigns SET error_count = error_count + 1, updated_at = $1 WHERE id = $2 RETURNING id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, deleted, start_immediately, time_to_start"
+		args = []interface{}{now, campaignID}
 	} else {
 		// Just return campaign
 		query = "SELECT id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, deleted, start_immediately, time_to_start FROM campaigns WHERE id = $1"
+		args = []interface{}{campaignID}
 	}
 
 	var c domain.Campaign
-	err = tx.QueryRow(ctx, query, campaignID).Scan(
+	err = tx.QueryRow(ctx, query, args...).Scan(
 		&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.Deleted, &c.StartImmediately, &c.TimeToStart)
 	if err != nil {
 		return nil, err
@@ -254,11 +261,12 @@ func (r *PostgresRepository) UpdateTargetStatus(ctx context.Context, targetID uu
 }
 
 func (r *PostgresRepository) UpdateCampaign(ctx context.Context, campaign *domain.Campaign) error {
+	now := time.Now().UTC()
 	_, err := r.pool.Exec(ctx, `
 		UPDATE campaigns 
-		SET name = $1, message_template = $2, status = $3, original_excel_path = $4, processed_excel_path = $5, deleted = $6, processed_count = $7, total_count = $8, error_count = $9, start_immediately = $10, time_to_start = $11, updated_at = NOW()
-		WHERE id = $12`,
-		campaign.Name, campaign.MessageTemplate, campaign.Status, campaign.OriginalExcelPath, campaign.ProcessedExcelPath, campaign.Deleted, campaign.ProcessedCount, campaign.TotalCount, campaign.ErrorCount, campaign.StartImmediately, campaign.TimeToStart, campaign.ID)
+		SET name = $1, message_template = $2, status = $3, original_excel_path = $4, processed_excel_path = $5, deleted = $6, processed_count = $7, total_count = $8, error_count = $9, start_immediately = $10, time_to_start = $11, updated_at = $12
+		WHERE id = $13`,
+		campaign.Name, campaign.MessageTemplate, campaign.Status, campaign.OriginalExcelPath, campaign.ProcessedExcelPath, campaign.Deleted, campaign.ProcessedCount, campaign.TotalCount, campaign.ErrorCount, campaign.StartImmediately, campaign.TimeToStart, now, campaign.ID)
 	return err
 }
 
@@ -335,12 +343,13 @@ func (r *PostgresRepository) GetCampaignTargetByID(ctx context.Context, targetID
 }
 
 func (r *PostgresRepository) GetActiveCampaignsReadyToStart(ctx context.Context) ([]*domain.Campaign, error) {
+	now := time.Now().UTC()
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, deleted, start_immediately, time_to_start, processed_count, total_count, error_count, created_at, updated_at
 		FROM campaigns WHERE status IN ('draft', 'processing') 
 			AND deleted = FALSE
-			AND (start_immediately = TRUE OR (time_to_start IS NOT NULL AND time_to_start <= NOW()))
-	`)
+			AND (start_immediately = TRUE OR (time_to_start IS NOT NULL AND time_to_start <= $1))
+	`, now)
 	if err != nil {
 		return nil, err
 	}
@@ -359,12 +368,63 @@ func (r *PostgresRepository) GetActiveCampaignsReadyToStart(ctx context.Context)
 }
 
 func (r *PostgresRepository) StopCampaign(ctx context.Context, campaignID uuid.UUID) error {
+	now := time.Now().UTC()
 	_, err := r.pool.Exec(ctx, `
 		UPDATE campaigns 
-		SET status = $1, updated_at = NOW()
-		WHERE id = $2
-	`, domain.CampaignStatusStopped, campaignID)
+		SET status = $1, updated_at = $2
+		WHERE id = $3
+	`, domain.CampaignStatusStopped, now, campaignID)
 	return err
+}
+
+func (r *PostgresRepository) StartCampaign(ctx context.Context, campaignID uuid.UUID) error {
+	// Get the campaign with its targets and message template
+	campaign, err := r.GetCampaign(ctx, campaignID)
+	if err != nil {
+		return fmt.Errorf("failed to get campaign: %w", err)
+	}
+
+	targets, err := r.GetCampaignTargets(ctx, campaignID)
+	if err != nil {
+		return fmt.Errorf("failed to get targets: %w", err)
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Update campaign status to processing
+	now := time.Now().UTC()
+	_, err = tx.Exec(ctx, "UPDATE campaigns SET status = $1, updated_at = $2 WHERE id = $3",
+		domain.CampaignStatusProcessing, now, campaignID)
+	if err != nil {
+		return fmt.Errorf("failed to update campaign status: %w", err)
+	}
+
+	// Create outbox messages for all pending targets
+	for _, target := range targets {
+		messageText := strings.ReplaceAll(campaign.MessageTemplate, "{user_name}", target.ClientName)
+
+		payload := fmt.Sprintf(`{"task_id":"%s", "campaign_id":"%s", "messenger":"max", "phone":"%s", "message_text":%q}`,
+			target.ID, campaign.ID, target.PhoneNormalized, messageText)
+
+		outboxID, err := uuid.NewV7()
+		if err != nil {
+			outboxID = uuid.New()
+		}
+
+		_, err = tx.Exec(ctx, `
+			INSERT INTO outbox_messages (id, event_type, payload, status)
+			VALUES ($1, $2, $3, $4)`,
+			outboxID, "message.send", []byte(payload), "pending")
+		if err != nil {
+			return fmt.Errorf("failed to insert outbox message: %w", err)
+		}
+	}
+
+	return tx.Commit(ctx)
 }
 
 func (r *PostgresRepository) GetRepliesByCampaign(ctx context.Context, campaignID uuid.UUID) ([]*domain.CampaignReply, error) {
@@ -400,8 +460,9 @@ func (r *PostgresRepository) RegisterReply(ctx context.Context, campaignID uuid.
 	// Find target by campaign and phone
 	var targetID uuid.UUID
 	var oldStatus domain.TaskStatus
-	err = tx.QueryRow(ctx, "UPDATE campaign_targets SET status = $1, last_reply_text = $2, replied_at = $3, updated_at = NOW() WHERE campaign_id = $4 AND phone_normalized = $5 RETURNING id, status",
-		domain.TaskStatusReplied, text, repliedAt, campaignID, phone).Scan(&targetID, &oldStatus)
+	now := time.Now().UTC()
+	err = tx.QueryRow(ctx, "UPDATE campaign_targets SET status = $1, last_reply_text = $2, replied_at = $3, updated_at = $4 WHERE campaign_id = $5 AND phone_normalized = $6 RETURNING id, status",
+		domain.TaskStatusReplied, text, repliedAt, now, campaignID, phone).Scan(&targetID, &oldStatus)
 	if err != nil {
 		return nil, err
 	}
@@ -443,7 +504,8 @@ func (r *PostgresRepository) RegisterReply(ctx context.Context, campaignID uuid.
 
 	// If all replied, mark campaign as completed
 	if repliedTargets >= totalTargets {
-		_, err = tx.Exec(ctx, `UPDATE campaigns SET status = 'completed', updated_at = NOW() WHERE id = $1`, campaignID)
+		now := time.Now().UTC()
+		_, err = tx.Exec(ctx, `UPDATE campaigns SET status = 'completed', updated_at = $1 WHERE id = $2`, now, campaignID)
 		if err != nil {
 			return nil, err
 		}

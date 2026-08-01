@@ -108,35 +108,14 @@ func (p *ReplyPoller) PollActiveCampaigns(_ context.Context) {
 
 	log.Println("ReplyPoller: Checking for active campaigns to poll...")
 
-	// Get campaigns that are ready to start (draft/processing with start_immediately=true or time_to_start passed)
-	readyCampaigns, err := p.repo.GetActiveCampaignsReadyToStart(ctx)
+	// Get campaigns that are in 'processing' status (already started)
+	processingCampaigns, err := p.repo.GetCampaignsByStatus(ctx, domain.CampaignStatusProcessing)
 	if err != nil {
-		ч
-		log.Printf("ReplyPoller: failed to get ready campaigns: %v", err)
+		log.Printf("ReplyPoller: failed to get processing campaigns: %v", err)
 		return
 	}
 
-	for _, c := range readyCampaigns {
-		// If campaign is draft, mark it as processing now
-		if c.Status == domain.CampaignStatusDraft {
-			log.Printf("ReplyPoller: Starting campaign %s", c.ID)
-			err := p.repo.UpdateCampaignStatus(ctx, c.ID, domain.CampaignStatusProcessing)
-			if err != nil {
-				log.Printf("ReplyPoller: failed to start campaign %s: %v", c.ID, err)
-				continue
-			}
-		}
-
-		// Check if 24 hours have passed since campaign creation
-		if time.Since(c.CreatedAt) > 24*time.Hour {
-			log.Printf("ReplyPoller: Campaign %s has been running for 24h, marking as completed", c.ID)
-			err := p.repo.UpdateCampaignStatus(ctx, c.ID, domain.CampaignStatusCompleted)
-			if err != nil {
-				log.Printf("ReplyPoller: failed to mark campaign %s as completed: %v", c.ID, err)
-			}
-			continue
-		}
-
+	for _, c := range processingCampaigns {
 		// Get targets that haven't replied yet (status is pending, sent, delivered, or viewed)
 		targets, err := p.repo.GetCampaignTargetsWithStatus(ctx, c.ID, []domain.TaskStatus{
 			domain.TaskStatusPending,

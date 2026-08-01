@@ -163,6 +163,9 @@ type CampaignRepository interface {
 	GetCampaignTargetByID(ctx context.Context, targetID uuid.UUID) (*CampaignTarget, error)
 	GetActiveCampaignsReadyToStart(ctx context.Context) ([]*Campaign, error)
 	StopCampaign(ctx context.Context, campaignID uuid.UUID) error
+	// StartCampaign transitions a campaign from draft to processing and creates
+	// outbox messages for all its pending targets so they get sent.
+	StartCampaign(ctx context.Context, campaignID uuid.UUID) error
 }
 
 type OutboxRepository interface {

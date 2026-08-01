@@ -67,7 +67,7 @@ func (uc *CampaignUseCase) UpdateTargetStatus(ctx context.Context, targetID uuid
 func (uc *CampaignUseCase) RegisterReply(ctx context.Context, campaignID uuid.UUID, phone, text string, repliedAt string) (*domain.Campaign, error) {
 	t, err := time.Parse(time.RFC3339, repliedAt)
 	if err != nil {
-		t = time.Now()
+		t = time.Now().UTC()
 	}
 	campaign, err := uc.repo.RegisterReply(ctx, campaignID, phone, text, t)
 	if err != nil {
@@ -151,7 +151,7 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 		campaignID = uuid.New()
 	}
 
-	createdAt := time.Now()
+	createdAt := time.Now().UTC()
 	originalExt := filepath.Ext(originalName)
 	if originalExt == "" {
 		originalExt = ".xlsx"
@@ -264,24 +264,29 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 	for target := range results {
 		targets = append(targets, target)
 
-		// Replace {user} in message template
-		messageText := strings.ReplaceAll(campaign.MessageTemplate, "{user_name}", target.ClientName)
+		// Only create outbox messages if starting immediately.
+		// For scheduled campaigns, outbox messages will be created
+		// when the poller transitions the campaign from draft to processing.
+		if startImmediately {
+			// Replace {user} in message template
+			messageText := strings.ReplaceAll(campaign.MessageTemplate, "{user_name}", target.ClientName)
 
-		// Create outbox message for each target
-		payload := fmt.Sprintf(`{"task_id":"%s", "campaign_id":"%s", "messenger":"max", "phone":"%s", "message_text":%q}`,
-			target.ID, campaign.ID, target.PhoneNormalized, messageText)
+			// Create outbox message for each target
+			payload := fmt.Sprintf(`{"task_id":"%s", "campaign_id":"%s", "messenger":"max", "phone":"%s", "message_text":%q}`,
+				target.ID, campaign.ID, target.PhoneNormalized, messageText)
 
-		outboxID, err := uuid.NewV7()
-		if err != nil {
-			outboxID = uuid.New()
+			outboxID, err := uuid.NewV7()
+			if err != nil {
+				outboxID = uuid.New()
+			}
+
+			outbox = append(outbox, &domain.OutboxMessage{
+				ID:        outboxID,
+				EventType: "message.send",
+				Payload:   []byte(payload),
+				Status:    "pending",
+			})
 		}
-
-		outbox = append(outbox, &domain.OutboxMessage{
-			ID:        outboxID,
-			EventType: "message.send",
-			Payload:   []byte(payload),
-			Status:    "pending",
-		})
 	}
 
 	select {
@@ -490,7 +495,7 @@ func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UU
 		f.SetCellValue(sheetName, replyTimeCell, replyTimeText)
 	}
 
-	processedFilename := generateSemanticFilename(campaign.Name+"_processed", time.Now(), ".xlsx")
+	processedFilename := generateSemanticFilename(campaign.Name+"_processed", time.Now().UTC(), ".xlsx")
 	processedFilePath := filepath.Join(uploadDir, processedFilename)
 
 	log.Printf("GenerateExcel: Saving processed file to: %s", processedFilePath)

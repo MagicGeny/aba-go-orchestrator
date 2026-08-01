@@ -68,6 +68,9 @@ func main() {
 	}
 	go outboxWorker.Run(ctx)
 
+	schedulerWorker := worker.NewSchedulerWorker(repo)
+	go schedulerWorker.Run(ctx)
+
 	replyPoller, err := worker.NewReplyPoller(repo, amqpConn, "tasks.messages.poll_replies")
 	if err != nil {
 		log.Fatalf("failed to init reply poller: %v", err)
