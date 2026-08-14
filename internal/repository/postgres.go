@@ -407,8 +407,8 @@ func (r *PostgresRepository) StartCampaign(ctx context.Context, campaignID uuid.
 	for _, target := range targets {
 		messageText := strings.ReplaceAll(campaign.MessageTemplate, "{user_name}", target.ClientName)
 
-		payload := fmt.Sprintf(`{"task_id":"%s", "campaign_id":"%s", "messenger":"max", "phone":"%s", "message_text":%q}`,
-			target.ID, campaign.ID, target.PhoneNormalized, messageText)
+		payload := fmt.Sprintf(`{"task_id":"%s", "campaign_id":"%s", "tenant_id":"%s", "messenger":"max", "phone":"%s", "message_text":%q}`,
+			target.ID, campaign.ID, campaign.TenantID, target.PhoneNormalized, messageText)
 
 		outboxID, err := uuid.NewV7()
 		if err != nil {
@@ -490,6 +490,19 @@ func (r *PostgresRepository) RegisterReply(ctx context.Context, campaignID uuid.
 		return nil, err
 	}
 
+	if strings.TrimSpace(text) == "@" {
+		now := time.Now().UTC()
+		_, err = tx.Exec(ctx, `
+			INSERT INTO tenant_blocked_recipients (tenant_id, phone_normalized, blocked_at, updated_at)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (tenant_id, phone_normalized) DO UPDATE
+			SET updated_at = EXCLUDED.updated_at
+		`, c.TenantID, phone, repliedAt, now)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Check if all targets have replied
 	var totalTargets int
 	var repliedTargets int
@@ -513,4 +526,81 @@ func (r *PostgresRepository) RegisterReply(ctx context.Context, campaignID uuid.
 	}
 
 	return &c, tx.Commit(ctx)
+}
+
+func (r *PostgresRepository) AddBlockedRecipient(ctx context.Context, tenantID uuid.UUID, phoneNormalized string) error {
+	now := time.Now().UTC()
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO tenant_blocked_recipients (tenant_id, phone_normalized, blocked_at, updated_at)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (tenant_id, phone_normalized) DO UPDATE
+		SET updated_at = EXCLUDED.updated_at
+	`, tenantID, phoneNormalized, now, now)
+	return err
+}
+
+func (r *PostgresRepository) ListBlockedRecipients(ctx context.Context) ([]*domain.BlockedRecipient, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT tenant_id, phone_normalized, blocked_at, created_at, updated_at
+		FROM tenant_blocked_recipients
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []*domain.BlockedRecipient
+	for rows.Next() {
+		var br domain.BlockedRecipient
+		err := rows.Scan(&br.TenantID, &br.PhoneNormalized, &br.BlockedAt, &br.CreatedAt, &br.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, &br)
+	}
+	return items, nil
+}
+
+func (r *PostgresRepository) UpsertChatPhoneMapping(ctx context.Context, mapping *domain.ChatPhoneMapping) error {
+	now := time.Now().UTC()
+	if mapping.ID == uuid.Nil {
+		id, err := uuid.NewV7()
+		if err != nil {
+			id = uuid.New()
+		}
+		mapping.ID = id
+	}
+	mapping.UpdatedAt = now
+	if mapping.CreatedAt.IsZero() {
+		mapping.CreatedAt = now
+	}
+
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO chat_phone_mappings (id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (chat_id) DO UPDATE
+		SET campaign_id = EXCLUDED.campaign_id,
+			campaign_target_id = EXCLUDED.campaign_target_id,
+			phone_normalized = EXCLUDED.phone_normalized,
+			viewer_id = EXCLUDED.viewer_id,
+			updated_at = EXCLUDED.updated_at
+	`, mapping.ID, mapping.ChatID, mapping.CampaignID, mapping.CampaignTargetID, mapping.PhoneNormalized, mapping.ViewerID, mapping.CreatedAt, mapping.UpdatedAt)
+	return err
+}
+
+func (r *PostgresRepository) GetChatPhoneMappingByChatID(ctx context.Context, chatID string) (*domain.ChatPhoneMapping, error) {
+	var m domain.ChatPhoneMapping
+	var viewerID *int64
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at
+		FROM chat_phone_mappings
+		WHERE chat_id = $1
+	`, chatID).Scan(
+		&m.ID, &m.ChatID, &m.CampaignID, &m.CampaignTargetID, &m.PhoneNormalized, &viewerID, &m.CreatedAt, &m.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	m.ViewerID = viewerID
+	return &m, nil
 }

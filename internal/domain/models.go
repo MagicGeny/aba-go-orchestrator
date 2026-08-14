@@ -123,13 +123,34 @@ type CampaignReply struct {
 	UpdatedAt        time.Time `json:"updated_at"`
 }
 
+type BlockedRecipient struct {
+	TenantID        uuid.UUID `json:"tenant_id"`
+	PhoneNormalized string    `json:"phone_normalized"`
+	BlockedAt       time.Time `json:"blocked_at"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+type ChatPhoneMapping struct {
+	ID               uuid.UUID `json:"id"`
+	ChatID           string    `json:"chat_id"`
+	CampaignID       uuid.UUID `json:"campaign_id"`
+	CampaignTargetID uuid.UUID `json:"campaign_target_id"`
+	PhoneNormalized  string    `json:"phone_normalized"`
+	ViewerID         *int64    `json:"viewer_id,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
 type TargetResult struct {
-	TargetID    uuid.UUID  `json:"target_id"`
-	CampaignID  uuid.UUID  `json:"campaign_id"`
-	PhoneNumber string     `json:"phone_number"`
-	Status      TaskStatus `json:"status"`
-	ReplyText   *string    `json:"reply_text,omitempty"`
-	Timestamp   time.Time  `json:"timestamp"`
+	TargetID     uuid.UUID  `json:"target_id"`
+	CampaignID   uuid.UUID  `json:"campaign_id"`
+	PhoneNumber  string     `json:"phone_number"`
+	Status       TaskStatus `json:"status"`
+	ReplyText    *string    `json:"reply_text,omitempty"`
+	ErrorMessage *string    `json:"error_message,omitempty"`
+	Timestamp    time.Time  `json:"timestamp"`
+	ChatID       string     `json:"chat_id,omitempty"`
 }
 
 // New DTOs for tenant admin notifications
@@ -166,9 +187,16 @@ type CampaignRepository interface {
 	// StartCampaign transitions a campaign from draft to processing and creates
 	// outbox messages for all its pending targets so they get sent.
 	StartCampaign(ctx context.Context, campaignID uuid.UUID) error
+	UpsertChatPhoneMapping(ctx context.Context, mapping *ChatPhoneMapping) error
+	GetChatPhoneMappingByChatID(ctx context.Context, chatID string) (*ChatPhoneMapping, error)
 }
 
 type OutboxRepository interface {
 	GetPendingMessages(ctx context.Context, limit int) ([]*OutboxMessage, error)
 	MarkAsProcessed(ctx context.Context, id uuid.UUID) error
+}
+
+type BlocklistRepository interface {
+	AddBlockedRecipient(ctx context.Context, tenantID uuid.UUID, phoneNormalized string) error
+	ListBlockedRecipients(ctx context.Context) ([]*BlockedRecipient, error)
 }

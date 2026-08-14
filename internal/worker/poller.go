@@ -86,6 +86,7 @@ func (p *ReplyPoller) Run(ctx context.Context) {
 	}
 }
 
+// active conpains
 func (p *ReplyPoller) PollActiveCampaigns(_ context.Context) {
 	// Create independent context with timeout to avoid context canceled errors
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

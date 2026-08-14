@@ -272,8 +272,8 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 			messageText := strings.ReplaceAll(campaign.MessageTemplate, "{user_name}", target.ClientName)
 
 			// Create outbox message for each target
-			payload := fmt.Sprintf(`{"task_id":"%s", "campaign_id":"%s", "messenger":"max", "phone":"%s", "message_text":%q}`,
-				target.ID, campaign.ID, target.PhoneNormalized, messageText)
+			payload := fmt.Sprintf(`{"task_id":"%s", "campaign_id":"%s", "tenant_id":"%s", "messenger":"max", "phone":"%s", "message_text":%q}`,
+				target.ID, campaign.ID, campaign.TenantID, target.PhoneNormalized, messageText)
 
 			outboxID, err := uuid.NewV7()
 			if err != nil {

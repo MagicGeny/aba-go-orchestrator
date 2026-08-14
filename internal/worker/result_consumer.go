@@ -3,13 +3,16 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/usecase"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/rabbitmq/amqp091-go"
 )
 
@@ -18,12 +21,17 @@ const (
 	flushInterval = 55 * time.Second
 )
 
+type BlocklistUpdater interface {
+	Add(tenantID uuid.UUID, phoneNormalized string)
+}
+
 type ResultConsumer struct {
 	repo      domain.CampaignRepository
 	uc        *usecase.CampaignUseCase
 	amqpConn  *amqp091.Connection
 	amqpChan  *amqp091.Channel // Added back amqpChan
 	queueName string
+	blocklist BlocklistUpdater
 	mu        sync.Mutex
 	isRunning bool
 	results   []domain.TargetResult
@@ -31,12 +39,14 @@ type ResultConsumer struct {
 	wg        sync.WaitGroup
 }
 
-func NewResultConsumer(repo domain.CampaignRepository, uc *usecase.CampaignUseCase, amqpConn *amqp091.Connection, queueName string) (*ResultConsumer, error) {
+func NewResultConsumer(repo domain.CampaignRepository, uc *usecase.CampaignUseCase, amqpConn *amqp091.Connection, queueName string, blocklist BlocklistUpdater) (*ResultConsumer, error) {
 	rc := &ResultConsumer{
 		repo:      repo,
 		uc:        uc,
 		amqpConn:  amqpConn,
 		queueName: queueName,
+		blocklist: blocklist,
+		stopChan:  make(chan struct{}),
 	}
 	err := rc.reconnect()
 	if err != nil {
@@ -203,32 +213,63 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 
 	log.Printf("ResultConsumer: processing batch of %d results", len(toProcess))
 
-	// Track unique campaign IDs to regenerate Excel files for
-	uniqueCampaignIDs := make(map[uuid.UUID]struct{})
 	// Track replies grouped by tenant
 	tenantReplies := make(map[uuid.UUID][]domain.ClientReplyInfo)
 
 	for _, result := range toProcess {
 		processCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
 
 		log.Printf("ResultConsumer: processing result for target %s, status: %s, reply: %v", result.TargetID, result.Status, result.ReplyText)
+
+		if result.ChatID != "" {
+			if result.Status == domain.TaskStatusSent && result.TargetID != uuid.Nil && result.CampaignID != uuid.Nil && strings.TrimSpace(result.PhoneNumber) != "" {
+				err := rc.repo.UpsertChatPhoneMapping(processCtx, &domain.ChatPhoneMapping{
+					ChatID:           result.ChatID,
+					CampaignID:       result.CampaignID,
+					CampaignTargetID: result.TargetID,
+					PhoneNormalized:  result.PhoneNumber,
+				})
+				if err != nil {
+					log.Printf("ResultConsumer: failed to upsert chat mapping for target %s chat_id=%s: %v", result.TargetID, result.ChatID, err)
+				}
+			}
+
+			if result.TargetID == uuid.Nil || result.CampaignID == uuid.Nil || strings.TrimSpace(result.PhoneNumber) == "" {
+				mapping, err := rc.repo.GetChatPhoneMappingByChatID(processCtx, result.ChatID)
+				if err != nil {
+					if errors.Is(err, pgx.ErrNoRows) {
+						log.Printf("ResultConsumer: chat_id mapping not found (skipping): chat_id=%s status=%s", result.ChatID, result.Status)
+					} else {
+						log.Printf("ResultConsumer: failed to resolve chat_id mapping (skipping): chat_id=%s err=%v", result.ChatID, err)
+					}
+					cancel()
+					continue
+				}
+				result.TargetID = mapping.CampaignTargetID
+				result.CampaignID = mapping.CampaignID
+				result.PhoneNumber = mapping.PhoneNormalized
+			}
+		}
 
 		if result.ReplyText != nil && result.Status == domain.TaskStatusReplied {
 			// First, register the reply in DB
 			campaign, err := rc.repo.RegisterReply(processCtx, result.CampaignID, result.PhoneNumber, *result.ReplyText, result.Timestamp)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to register reply for target %s: %v", result.TargetID, err)
+				cancel()
 				continue
 			}
-
-			uniqueCampaignIDs[result.CampaignID] = struct{}{}
 
 			// Now, get the CampaignTarget to retrieve ClientName
 			target, err := rc.repo.GetCampaignTargetByID(processCtx, result.TargetID)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to get target %s: %v", result.TargetID, err)
+				cancel()
 				continue
+			}
+
+			if strings.TrimSpace(*result.ReplyText) == "@" && rc.blocklist != nil {
+				rc.blocklist.Add(campaign.TenantID, target.PhoneNormalized)
 			}
 
 			// Add to tenantReplies
@@ -240,32 +281,17 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 			})
 		} else if result.Status == domain.TaskStatusViewed {
 			// Handle "viewed" status - update target status and record viewed time
-			_, err := rc.repo.UpdateTargetStatus(processCtx, result.TargetID, domain.TaskStatus(result.Status), nil, nil)
+			_, err := rc.repo.UpdateTargetStatus(processCtx, result.TargetID, domain.TaskStatus(result.Status), result.ErrorMessage, nil)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to update target %s status to %s: %v", result.TargetID, result.Status, err)
-			} else {
-				uniqueCampaignIDs[result.CampaignID] = struct{}{}
 			}
 		} else if result.Status != "" {
-			_, err := rc.repo.UpdateTargetStatus(processCtx, result.TargetID, domain.TaskStatus(result.Status), nil, nil)
+			_, err := rc.repo.UpdateTargetStatus(processCtx, result.TargetID, domain.TaskStatus(result.Status), result.ErrorMessage, nil)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to update target %s status to %s: %v", result.TargetID, result.Status, err)
-			} else {
-				uniqueCampaignIDs[result.CampaignID] = struct{}{}
 			}
 		}
-	}
-
-	// Now regenerate Excel files for each unique campaign
-	for campaignID := range uniqueCampaignIDs {
-		log.Printf("ResultConsumer: regenerating Excel for campaign %s", campaignID)
-		excelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-
-		_, err := rc.uc.GenerateExcel(excelCtx, campaignID)
-		if err != nil {
-			log.Printf("ResultConsumer: failed to generate Excel for campaign %s: %v", campaignID, err)
-		}
+		cancel()
 	}
 
 	// Now, send tenant admin notifications

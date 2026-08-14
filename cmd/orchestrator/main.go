@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"database/sql" // Добавили стандартный SQL для миграций
+	"database/sql"
 	"log"
 	"net/http"
 	"os"
@@ -16,9 +16,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/joho/godotenv"
-	"github.com/rabbitmq/amqp091-go" // Пакет для RabbitMQ без дефисов в коде
+	"github.com/rabbitmq/amqp091-go"
 
-	// ПОДКЛЮЧАЕМ ТВОИ ВНУТРЕННИЕ ПАКЕТЫ (MagicGeny):
+	"github.com/MagicGeny/aba-go-orchestrator/internal/blocklist"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/repository"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/transport"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/usecase"
@@ -62,7 +62,10 @@ func main() {
 	hub := transport.NewHub()
 
 	// 4. Start Workers
-	outboxWorker, err := worker.NewOutboxWorker(repo, amqpConn, "tasks.messages.send")
+	blocklistCache := blocklist.NewCache(repo, 10*time.Minute)
+	go blocklistCache.Run(ctx)
+
+	outboxWorker, err := worker.NewOutboxWorker(repo, amqpConn, "tasks.messages.send", "tasks.messages.results_replies_queue", blocklistCache)
 	if err != nil {
 		log.Fatalf("failed to init outbox worker: %v", err)
 	}
@@ -77,7 +80,7 @@ func main() {
 	}
 	go replyPoller.Run(ctx)
 
-	resultConsumer, err := worker.NewResultConsumer(repo, campaignUC, amqpConn, "tasks.messages.results_replies_queue")
+	resultConsumer, err := worker.NewResultConsumer(repo, campaignUC, amqpConn, "tasks.messages.results_replies_queue", blocklistCache)
 	if err != nil {
 		log.Fatalf("failed to init result consumer: %v", err)
 	}
