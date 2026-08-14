@@ -70,7 +70,7 @@ func (p *ReplyPoller) reconnect() error {
 
 func (p *ReplyPoller) Run(ctx context.Context) {
 	// Poll every 10 minutes as requested
-	ticker := time.NewTicker(30 * time.Minute)
+	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
 
 	// Initial poll

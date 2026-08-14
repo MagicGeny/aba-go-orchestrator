@@ -54,13 +54,6 @@ func (uc *CampaignUseCase) UpdateTargetStatus(ctx context.Context, targetID uuid
 	if err != nil {
 		return nil, err
 	}
-	// Regenerate the processed Excel file after status update - use independent context
-	excelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	_, err = uc.GenerateExcel(excelCtx, campaign.ID)
-	if err != nil {
-		fmt.Printf("Warning: failed to update processed Excel file: %v\n", err)
-	}
 	return campaign, nil
 }
 
@@ -72,13 +65,6 @@ func (uc *CampaignUseCase) RegisterReply(ctx context.Context, campaignID uuid.UU
 	campaign, err := uc.repo.RegisterReply(ctx, campaignID, phone, text, t)
 	if err != nil {
 		return nil, err
-	}
-	// Regenerate the processed Excel file after reply - use independent context
-	excelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	_, err = uc.GenerateExcel(excelCtx, campaign.ID)
-	if err != nil {
-		fmt.Printf("Warning: failed to update processed Excel file: %v\n", err)
 	}
 	return campaign, nil
 }
@@ -301,12 +287,6 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 		// Clean up the uploaded file if campaign creation fails
 		_ = os.Remove(originalFilePath)
 		return uuid.Nil, err
-	}
-
-	// Generate initial processed Excel file
-	_, err = uc.GenerateExcel(ctx, campaign.ID)
-	if err != nil {
-		fmt.Printf("Warning: failed to generate initial processed Excel file: %v\n", err)
 	}
 
 	return campaignID, nil

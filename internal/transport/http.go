@@ -283,18 +283,11 @@ func (h *HTTPHandler) DownloadCampaign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use existing processed Excel file if available, otherwise generate new
-	var filePath string
-	if campaign.ProcessedExcelPath != nil && *campaign.ProcessedExcelPath != "" {
-		filePath = *campaign.ProcessedExcelPath
-	} else {
-		// Generate Excel file if not exists
-		filePath, err = h.campaignUC.GenerateExcel(ctx, campaignID)
-		if err != nil {
-			log.Printf("Failed to generate excel: %v", err)
-			http.Error(w, "failed to generate excel", http.StatusInternalServerError)
-			return
-		}
+	filePath, err := h.campaignUC.GenerateExcel(ctx, campaignID)
+	if err != nil {
+		log.Printf("Failed to generate excel: %v", err)
+		http.Error(w, "failed to generate excel", http.StatusInternalServerError)
+		return
 	}
 
 	// Open the file
