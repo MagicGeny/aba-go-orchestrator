@@ -53,6 +53,7 @@ func (h *HTTPHandler) UploadCampaign(w http.ResponseWriter, r *http.Request) {
 		startImmediately = false
 	}
 
+	//time
 	var timeToStart *time.Time
 	timeToStartStr := r.FormValue("time_to_start")
 	if timeToStartStr != "" {

@@ -85,6 +85,8 @@ func (w *OutboxWorker) processMessages(ctx context.Context) {
 		return
 	}
 
+	processedIDs := make([]uuid.UUID, 0, len(messages))
+
 	for _, msg := range messages {
 		var sendTask struct {
 			TaskID      string `json:"task_id"`
@@ -127,9 +129,7 @@ func (w *OutboxWorker) processMessages(ctx context.Context) {
 							log.Printf("failed to publish blocked result for message %s: %v", msg.ID, err)
 							continue
 						}
-						if err := w.repo.MarkAsProcessed(ctx, msg.ID); err != nil {
-							log.Printf("failed to mark message %s as processed: %v", msg.ID, err)
-						}
+						processedIDs = append(processedIDs, msg.ID)
 						continue
 					}
 				}
@@ -151,8 +151,26 @@ func (w *OutboxWorker) processMessages(ctx context.Context) {
 			continue
 		}
 
-		if err := w.repo.MarkAsProcessed(ctx, msg.ID); err != nil {
-			log.Printf("failed to mark message %s as processed: %v", msg.ID, err)
+		processedIDs = append(processedIDs, msg.ID)
+	}
+
+	if len(processedIDs) == 0 {
+		return
+	}
+
+	type processedBatchRepo interface {
+		MarkAsProcessedBatch(ctx context.Context, ids []uuid.UUID) error
+	}
+	if br, ok := w.repo.(processedBatchRepo); ok {
+		if err := br.MarkAsProcessedBatch(ctx, processedIDs); err != nil {
+			log.Printf("failed to mark %d messages as processed (batch): %v", len(processedIDs), err)
+		}
+		return
+	}
+
+	for _, id := range processedIDs {
+		if err := w.repo.MarkAsProcessed(ctx, id); err != nil {
+			log.Printf("failed to mark message %s as processed: %v", id, err)
 		}
 	}
 }

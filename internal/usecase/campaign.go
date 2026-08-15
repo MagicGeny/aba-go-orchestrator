@@ -354,20 +354,8 @@ func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UU
 		return "", fmt.Errorf("original excel file not found")
 	}
 
-	// Choose which file to open: use processed if exists, otherwise original
-	var filePathToOpen string
-	if campaign.ProcessedExcelPath != nil && *campaign.ProcessedExcelPath != "" {
-		if _, err := os.Stat(*campaign.ProcessedExcelPath); err == nil {
-			filePathToOpen = *campaign.ProcessedExcelPath
-			log.Printf("GenerateExcel: Using processed file: %s", filePathToOpen)
-		} else {
-			filePathToOpen = *campaign.OriginalExcelPath
-			log.Printf("GenerateExcel: Processed file not found, using original: %s", filePathToOpen)
-		}
-	} else {
-		filePathToOpen = *campaign.OriginalExcelPath
-		log.Printf("GenerateExcel: No processed file, using original: %s", filePathToOpen)
-	}
+	filePathToOpen := *campaign.OriginalExcelPath
+	log.Printf("GenerateExcel: Using original file: %s", filePathToOpen)
 
 	// Open the file
 	f, err := excelize.OpenFile(filePathToOpen)
@@ -475,7 +463,7 @@ func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UU
 		f.SetCellValue(sheetName, replyTimeCell, replyTimeText)
 	}
 
-	processedFilename := generateSemanticFilename(campaign.Name+"_processed", time.Now().UTC(), ".xlsx")
+	processedFilename := generateSemanticFilename(campaign.Name+"_processed_"+uuid.NewString(), time.Now().UTC(), ".xlsx")
 	processedFilePath := filepath.Join(uploadDir, processedFilename)
 
 	log.Printf("GenerateExcel: Saving processed file to: %s", processedFilePath)
@@ -483,11 +471,6 @@ func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UU
 	if err != nil {
 		log.Printf("GenerateExcel: failed to save processed excel: %v", err)
 		return "", fmt.Errorf("failed to save processed excel: %w", err)
-	}
-
-	if campaign.ProcessedExcelPath != nil && *campaign.ProcessedExcelPath != "" && *campaign.ProcessedExcelPath != processedFilePath {
-		log.Printf("GenerateExcel: Removing old processed file: %s", *campaign.ProcessedExcelPath)
-		_ = os.Remove(*campaign.ProcessedExcelPath)
 	}
 
 	campaign.ProcessedExcelPath = &processedFilePath

@@ -34,9 +34,14 @@ type ResultConsumer struct {
 	blocklist BlocklistUpdater
 	mu        sync.Mutex
 	isRunning bool
-	results   []domain.TargetResult
+	results   []queuedResult
 	stopChan  chan struct{}
 	wg        sync.WaitGroup
+}
+
+type queuedResult struct {
+	result domain.TargetResult
+	msg    amqp091.Delivery
 }
 
 func NewResultConsumer(repo domain.CampaignRepository, uc *usecase.CampaignUseCase, amqpConn *amqp091.Connection, queueName string, blocklist BlocklistUpdater) (*ResultConsumer, error) {
@@ -125,7 +130,7 @@ func (rc *ResultConsumer) Run(ctx context.Context) error {
 	msgs, err := ch.Consume(
 		rc.queueName,
 		"result-consumer",
-		true,
+		false,
 		false,
 		false,
 		false,
@@ -151,6 +156,7 @@ func (rc *ResultConsumer) Run(ctx context.Context) error {
 
 			if len(msg.Body) == 0 {
 				log.Println("ResultConsumer: skipping empty message")
+				_ = msg.Ack(false)
 				continue
 			}
 
@@ -160,11 +166,12 @@ func (rc *ResultConsumer) Run(ctx context.Context) error {
 			err := json.Unmarshal(msg.Body, &result)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to unmarshal message (skipping): %v, body: %s", err, string(msg.Body))
+				_ = msg.Ack(false)
 				continue
 			}
 
 			rc.mu.Lock()
-			rc.results = append(rc.results, result)
+			rc.results = append(rc.results, queuedResult{result: result, msg: msg})
 			count := len(rc.results)
 			rc.mu.Unlock()
 
@@ -207,7 +214,7 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 		return
 	}
 
-	toProcess := make([]domain.TargetResult, len(rc.results))
+	toProcess := make([]queuedResult, len(rc.results))
 	copy(toProcess, rc.results)
 	rc.results = nil
 
@@ -216,10 +223,13 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 	// Track replies grouped by tenant
 	tenantReplies := make(map[uuid.UUID][]domain.ClientReplyInfo)
 
-	for _, result := range toProcess {
+	for _, item := range toProcess {
+		result := item.result
 		processCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 
 		log.Printf("ResultConsumer: processing result for target %s, status: %s, reply: %v", result.TargetID, result.Status, result.ReplyText)
+
+		processedOK := true
 
 		if result.ChatID != "" {
 			if result.Status == domain.TaskStatusSent && result.TargetID != uuid.Nil && result.CampaignID != uuid.Nil && strings.TrimSpace(result.PhoneNumber) != "" {
@@ -231,6 +241,7 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				})
 				if err != nil {
 					log.Printf("ResultConsumer: failed to upsert chat mapping for target %s chat_id=%s: %v", result.TargetID, result.ChatID, err)
+					processedOK = false
 				}
 			}
 
@@ -243,6 +254,7 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 						log.Printf("ResultConsumer: failed to resolve chat_id mapping (skipping): chat_id=%s err=%v", result.ChatID, err)
 					}
 					cancel()
+					_ = item.msg.Ack(false)
 					continue
 				}
 				result.TargetID = mapping.CampaignTargetID
@@ -256,16 +268,18 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 			campaign, err := rc.repo.RegisterReply(processCtx, result.CampaignID, result.PhoneNumber, *result.ReplyText, result.Timestamp)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to register reply for target %s: %v", result.TargetID, err)
+				processedOK = false
 				cancel()
-				continue
+				goto finish
 			}
 
 			// Now, get the CampaignTarget to retrieve ClientName
 			target, err := rc.repo.GetCampaignTargetByID(processCtx, result.TargetID)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to get target %s: %v", result.TargetID, err)
+				processedOK = false
 				cancel()
-				continue
+				goto finish
 			}
 
 			if strings.TrimSpace(*result.ReplyText) == "@" && rc.blocklist != nil {
@@ -284,14 +298,27 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 			_, err := rc.repo.UpdateTargetStatus(processCtx, result.TargetID, domain.TaskStatus(result.Status), result.ErrorMessage, nil)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to update target %s status to %s: %v", result.TargetID, result.Status, err)
+				processedOK = false
 			}
 		} else if result.Status != "" {
 			_, err := rc.repo.UpdateTargetStatus(processCtx, result.TargetID, domain.TaskStatus(result.Status), result.ErrorMessage, nil)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to update target %s status to %s: %v", result.TargetID, result.Status, err)
+				processedOK = false
 			}
 		}
 		cancel()
+
+	finish:
+		if processedOK {
+			if err := item.msg.Ack(false); err != nil {
+				log.Printf("ResultConsumer: failed to ack message: %v", err)
+			}
+		} else {
+			if err := item.msg.Nack(false, true); err != nil {
+				log.Printf("ResultConsumer: failed to nack message: %v", err)
+			}
+		}
 	}
 
 	// Now, send tenant admin notifications

@@ -68,13 +68,20 @@ func (s *SchedulerWorker) checkAndStartCampaigns(ctx context.Context) {
 
 	for _, c := range readyCampaigns {
 		if c.Status == domain.CampaignStatusDraft {
-			log.Printf("SchedulerWorker: Starting scheduled campaign %s (name=%q, time_to_start=%v)", c.ID, c.Name, c.TimeToStart)
-			err := s.repo.StartCampaign(checkCtx, c.ID)
-			if err != nil {
-				log.Printf("SchedulerWorker: failed to start campaign %s: %v", c.ID, err)
-				continue
-			}
-			log.Printf("SchedulerWorker: Successfully started campaign %s", c.ID)
+			campaignID := c.ID
+			campaignName := c.Name
+			campaignTime := c.TimeToStart
+			log.Printf("SchedulerWorker: Starting scheduled campaign %s (name=%q, time_to_start=%v)", campaignID, campaignName, campaignTime)
+			go func() {
+				startCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+				defer cancel()
+				err := s.repo.StartCampaign(startCtx, campaignID)
+				if err != nil {
+					log.Printf("SchedulerWorker: failed to start campaign %s: %v", campaignID, err)
+					return
+				}
+				log.Printf("SchedulerWorker: Successfully started campaign %s", campaignID)
+			}()
 		}
 	}
 }

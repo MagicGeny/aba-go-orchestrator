@@ -209,6 +209,19 @@ func (r *PostgresRepository) MarkAsProcessed(ctx context.Context, id uuid.UUID) 
 	return err
 }
 
+func (r *PostgresRepository) MarkAsProcessedBatch(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	idStrings := make([]string, 0, len(ids))
+	for _, id := range ids {
+		idStrings = append(idStrings, id.String())
+	}
+	_, err := r.pool.Exec(ctx, "UPDATE outbox_messages SET status = 'processed', processed_at = $1 WHERE id = ANY($2::uuid[])", now, idStrings)
+	return err
+}
+
 func (r *PostgresRepository) UpdateTargetStatus(ctx context.Context, targetID uuid.UUID, status domain.TaskStatus, lastError *string, sentAt *time.Time) (*domain.Campaign, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -384,11 +397,6 @@ func (r *PostgresRepository) StartCampaign(ctx context.Context, campaignID uuid.
 		return fmt.Errorf("failed to get campaign: %w", err)
 	}
 
-	targets, err := r.GetCampaignTargets(ctx, campaignID)
-	if err != nil {
-		return fmt.Errorf("failed to get targets: %w", err)
-	}
-
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin tx: %w", err)
@@ -397,30 +405,67 @@ func (r *PostgresRepository) StartCampaign(ctx context.Context, campaignID uuid.
 
 	// Update campaign status to processing
 	now := time.Now().UTC()
-	_, err = tx.Exec(ctx, "UPDATE campaigns SET status = $1, updated_at = $2 WHERE id = $3",
-		domain.CampaignStatusProcessing, now, campaignID)
+	tag, err := tx.Exec(ctx, "UPDATE campaigns SET status = $1, updated_at = $2 WHERE id = $3 AND status = $4",
+		domain.CampaignStatusProcessing, now, campaignID, domain.CampaignStatusDraft)
 	if err != nil {
 		return fmt.Errorf("failed to update campaign status: %w", err)
 	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
 
 	// Create outbox messages for all pending targets
-	for _, target := range targets {
-		messageText := strings.ReplaceAll(campaign.MessageTemplate, "{user_name}", target.ClientName)
+	rows, err := tx.Query(ctx, `SELECT id, client_name, phone_normalized FROM campaign_targets WHERE campaign_id = $1`, campaignID)
+	if err != nil {
+		return fmt.Errorf("failed to query targets: %w", err)
+	}
+	defer rows.Close()
 
+	const chunkSize = 1000
+	chunk := make([][]any, 0, chunkSize)
+	for rows.Next() {
+		var targetID uuid.UUID
+		var clientName string
+		var phoneNormalized string
+		if err := rows.Scan(&targetID, &clientName, &phoneNormalized); err != nil {
+			return fmt.Errorf("failed to scan target: %w", err)
+		}
+
+		messageText := strings.ReplaceAll(campaign.MessageTemplate, "{user_name}", clientName)
 		payload := fmt.Sprintf(`{"task_id":"%s", "campaign_id":"%s", "tenant_id":"%s", "messenger":"max", "phone":"%s", "message_text":%q}`,
-			target.ID, campaign.ID, campaign.TenantID, target.PhoneNormalized, messageText)
+			targetID, campaign.ID, campaign.TenantID, phoneNormalized, messageText)
 
 		outboxID, err := uuid.NewV7()
 		if err != nil {
 			outboxID = uuid.New()
 		}
+		chunk = append(chunk, []any{outboxID, "message.send", []byte(payload), "pending"})
 
-		_, err = tx.Exec(ctx, `
-			INSERT INTO outbox_messages (id, event_type, payload, status)
-			VALUES ($1, $2, $3, $4)`,
-			outboxID, "message.send", []byte(payload), "pending")
+		if len(chunk) >= chunkSize {
+			_, err := tx.CopyFrom(
+				ctx,
+				pgx.Identifier{"outbox_messages"},
+				[]string{"id", "event_type", "payload", "status"},
+				pgx.CopyFromRows(chunk),
+			)
+			if err != nil {
+				return fmt.Errorf("failed to bulk insert outbox: %w", err)
+			}
+			chunk = chunk[:0]
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate targets: %w", err)
+	}
+	if len(chunk) > 0 {
+		_, err := tx.CopyFrom(
+			ctx,
+			pgx.Identifier{"outbox_messages"},
+			[]string{"id", "event_type", "payload", "status"},
+			pgx.CopyFromRows(chunk),
+		)
 		if err != nil {
-			return fmt.Errorf("failed to insert outbox message: %w", err)
+			return fmt.Errorf("failed to bulk insert outbox: %w", err)
 		}
 	}
 
