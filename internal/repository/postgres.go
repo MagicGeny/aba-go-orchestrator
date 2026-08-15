@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -30,9 +31,9 @@ func (r *PostgresRepository) CreateCampaign(ctx context.Context, campaign *domai
 
 	// Insert campaign
 	_, err = tx.Exec(ctx, `
-		INSERT INTO campaigns (id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, total_count, start_immediately, time_to_start)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-		campaign.ID, campaign.TenantID, campaign.Name, campaign.MessageTemplate, campaign.Status, campaign.OriginalExcelName, campaign.OriginalExcelPath, campaign.ProcessedExcelPath, campaign.TotalCount, campaign.StartImmediately, campaign.TimeToStart)
+		INSERT INTO campaigns (id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, attachment_url, attachment_name, total_count, start_immediately, time_to_start)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+		campaign.ID, campaign.TenantID, campaign.Name, campaign.MessageTemplate, campaign.Status, campaign.OriginalExcelName, campaign.OriginalExcelPath, campaign.ProcessedExcelPath, campaign.AttachmentURL, campaign.AttachmentName, campaign.TotalCount, campaign.StartImmediately, campaign.TimeToStart)
 	if err != nil {
 		return fmt.Errorf("failed to insert campaign: %w", err)
 	}
@@ -75,9 +76,9 @@ func (r *PostgresRepository) CreateCampaign(ctx context.Context, campaign *domai
 func (r *PostgresRepository) GetCampaign(ctx context.Context, id uuid.UUID) (*domain.Campaign, error) {
 	var c domain.Campaign
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, deleted, start_immediately, time_to_start, processed_count, total_count, error_count, created_at, updated_at
+		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, attachment_url, attachment_name, deleted, start_immediately, time_to_start, processed_count, total_count, error_count, created_at, updated_at
 		FROM campaigns WHERE id = $1`, id).Scan(
-		&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.Deleted, &c.StartImmediately, &c.TimeToStart, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt)
+		&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.AttachmentURL, &c.AttachmentName, &c.Deleted, &c.StartImmediately, &c.TimeToStart, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +88,7 @@ func (r *PostgresRepository) GetCampaign(ctx context.Context, id uuid.UUID) (*do
 func (r *PostgresRepository) ListCampaigns(ctx context.Context, tenantID uuid.UUID) ([]*domain.Campaign, error) {
 	log.Printf("ListCampaigns called for tenant: %v", tenantID)
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, deleted, start_immediately, time_to_start, processed_count, total_count, error_count, created_at, updated_at
+		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, attachment_url, attachment_name, deleted, start_immediately, time_to_start, processed_count, total_count, error_count, created_at, updated_at
 		FROM campaigns WHERE tenant_id = $1 AND deleted = FALSE ORDER BY created_at DESC`, tenantID)
 	if err != nil {
 		log.Printf("ListCampaigns query error: %v", err)
@@ -98,7 +99,7 @@ func (r *PostgresRepository) ListCampaigns(ctx context.Context, tenantID uuid.UU
 	var campaigns []*domain.Campaign
 	for rows.Next() {
 		var c domain.Campaign
-		err := rows.Scan(&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.Deleted, &c.StartImmediately, &c.TimeToStart, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt)
+		err := rows.Scan(&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.AttachmentURL, &c.AttachmentName, &c.Deleted, &c.StartImmediately, &c.TimeToStart, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt)
 		if err != nil {
 			log.Printf("ListCampaigns scan error: %v", err)
 			return nil, err
@@ -139,7 +140,7 @@ func (r *PostgresRepository) GetCampaignTargets(ctx context.Context, campaignID 
 
 func (r *PostgresRepository) GetCampaignsByStatus(ctx context.Context, status domain.CampaignStatus) ([]*domain.Campaign, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, deleted, start_immediately, time_to_start, processed_count, total_count, error_count, created_at, updated_at
+		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, attachment_url, attachment_name, deleted, start_immediately, time_to_start, processed_count, total_count, error_count, created_at, updated_at
 		FROM campaigns WHERE status = $1 AND deleted = false`, status)
 	if err != nil {
 		return nil, err
@@ -149,7 +150,7 @@ func (r *PostgresRepository) GetCampaignsByStatus(ctx context.Context, status do
 	var campaigns []*domain.Campaign
 	for rows.Next() {
 		var c domain.Campaign
-		err := rows.Scan(&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.Deleted, &c.StartImmediately, &c.TimeToStart, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt)
+		err := rows.Scan(&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.AttachmentURL, &c.AttachmentName, &c.Deleted, &c.StartImmediately, &c.TimeToStart, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -252,20 +253,20 @@ func (r *PostgresRepository) UpdateTargetStatus(ctx context.Context, targetID uu
 	var query string
 	var args []interface{}
 	if status == domain.TaskStatusDelivered {
-		query = "UPDATE campaigns SET processed_count = processed_count + 1, updated_at = $1 WHERE id = $2 RETURNING id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, deleted, start_immediately, time_to_start"
+		query = "UPDATE campaigns SET processed_count = processed_count + 1, updated_at = $1 WHERE id = $2 RETURNING id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, attachment_url, attachment_name, deleted, start_immediately, time_to_start"
 		args = []interface{}{now, campaignID}
 	} else if status == domain.TaskStatusFailed {
-		query = "UPDATE campaigns SET error_count = error_count + 1, updated_at = $1 WHERE id = $2 RETURNING id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, deleted, start_immediately, time_to_start"
+		query = "UPDATE campaigns SET error_count = error_count + 1, updated_at = $1 WHERE id = $2 RETURNING id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, attachment_url, attachment_name, deleted, start_immediately, time_to_start"
 		args = []interface{}{now, campaignID}
 	} else {
 		// Just return campaign
-		query = "SELECT id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, deleted, start_immediately, time_to_start FROM campaigns WHERE id = $1"
+		query = "SELECT id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, attachment_url, attachment_name, deleted, start_immediately, time_to_start FROM campaigns WHERE id = $1"
 		args = []interface{}{campaignID}
 	}
 
 	var c domain.Campaign
 	err = tx.QueryRow(ctx, query, args...).Scan(
-		&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.Deleted, &c.StartImmediately, &c.TimeToStart)
+		&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.AttachmentURL, &c.AttachmentName, &c.Deleted, &c.StartImmediately, &c.TimeToStart)
 	if err != nil {
 		return nil, err
 	}
@@ -277,9 +278,9 @@ func (r *PostgresRepository) UpdateCampaign(ctx context.Context, campaign *domai
 	now := time.Now().UTC()
 	_, err := r.pool.Exec(ctx, `
 		UPDATE campaigns 
-		SET name = $1, message_template = $2, status = $3, original_excel_path = $4, processed_excel_path = $5, deleted = $6, processed_count = $7, total_count = $8, error_count = $9, start_immediately = $10, time_to_start = $11, updated_at = $12
-		WHERE id = $13`,
-		campaign.Name, campaign.MessageTemplate, campaign.Status, campaign.OriginalExcelPath, campaign.ProcessedExcelPath, campaign.Deleted, campaign.ProcessedCount, campaign.TotalCount, campaign.ErrorCount, campaign.StartImmediately, campaign.TimeToStart, now, campaign.ID)
+		SET name = $1, message_template = $2, status = $3, original_excel_path = $4, processed_excel_path = $5, attachment_url = $6, attachment_name = $7, deleted = $8, processed_count = $9, total_count = $10, error_count = $11, start_immediately = $12, time_to_start = $13, updated_at = $14
+		WHERE id = $15`,
+		campaign.Name, campaign.MessageTemplate, campaign.Status, campaign.OriginalExcelPath, campaign.ProcessedExcelPath, campaign.AttachmentURL, campaign.AttachmentName, campaign.Deleted, campaign.ProcessedCount, campaign.TotalCount, campaign.ErrorCount, campaign.StartImmediately, campaign.TimeToStart, now, campaign.ID)
 	return err
 }
 
@@ -358,7 +359,7 @@ func (r *PostgresRepository) GetCampaignTargetByID(ctx context.Context, targetID
 func (r *PostgresRepository) GetActiveCampaignsReadyToStart(ctx context.Context) ([]*domain.Campaign, error) {
 	now := time.Now().UTC()
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, deleted, start_immediately, time_to_start, processed_count, total_count, error_count, created_at, updated_at
+		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, attachment_url, attachment_name, deleted, start_immediately, time_to_start, processed_count, total_count, error_count, created_at, updated_at
 		FROM campaigns WHERE status IN ('draft', 'processing') 
 			AND deleted = FALSE
 			AND (start_immediately = TRUE OR (time_to_start IS NOT NULL AND time_to_start <= $1))
@@ -371,7 +372,7 @@ func (r *PostgresRepository) GetActiveCampaignsReadyToStart(ctx context.Context)
 	var campaigns []*domain.Campaign
 	for rows.Next() {
 		var c domain.Campaign
-		err := rows.Scan(&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.Deleted, &c.StartImmediately, &c.TimeToStart, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt)
+		err := rows.Scan(&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.AttachmentURL, &c.AttachmentName, &c.Deleted, &c.StartImmediately, &c.TimeToStart, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -432,14 +433,34 @@ func (r *PostgresRepository) StartCampaign(ctx context.Context, campaignID uuid.
 		}
 
 		messageText := strings.ReplaceAll(campaign.MessageTemplate, "{user_name}", clientName)
-		payload := fmt.Sprintf(`{"task_id":"%s", "campaign_id":"%s", "tenant_id":"%s", "messenger":"max", "phone":"%s", "message_text":%q}`,
-			targetID, campaign.ID, campaign.TenantID, phoneNormalized, messageText)
+		payload, err := json.Marshal(struct {
+			TaskID         string  `json:"task_id"`
+			CampaignID     string  `json:"campaign_id"`
+			TenantID       string  `json:"tenant_id"`
+			Messenger      string  `json:"messenger"`
+			Phone          string  `json:"phone"`
+			MessageText    string  `json:"message_text"`
+			AttachmentURL  *string `json:"attachment_url,omitempty"`
+			AttachmentName *string `json:"attachment_name,omitempty"`
+		}{
+			TaskID:         targetID.String(),
+			CampaignID:     campaign.ID.String(),
+			TenantID:       campaign.TenantID.String(),
+			Messenger:      "max",
+			Phone:          phoneNormalized,
+			MessageText:    messageText,
+			AttachmentURL:  campaign.AttachmentURL,
+			AttachmentName: campaign.AttachmentName,
+		})
+		if err != nil {
+			return err
+		}
 
 		outboxID, err := uuid.NewV7()
 		if err != nil {
 			outboxID = uuid.New()
 		}
-		chunk = append(chunk, []any{outboxID, "message.send", []byte(payload), "pending"})
+		chunk = append(chunk, []any{outboxID, "message.send", payload, "pending"})
 
 		if len(chunk) >= chunkSize {
 			_, err := tx.CopyFrom(
@@ -528,9 +549,9 @@ func (r *PostgresRepository) RegisterReply(ctx context.Context, campaignID uuid.
 	// Get updated campaign
 	var c domain.Campaign
 	err = tx.QueryRow(ctx, `
-		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, deleted, start_immediately, time_to_start, processed_count, total_count, error_count, created_at, updated_at
+		SELECT id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, attachment_url, attachment_name, deleted, start_immediately, time_to_start, processed_count, total_count, error_count, created_at, updated_at
 		FROM campaigns WHERE id = $1`, campaignID).Scan(
-		&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.Deleted, &c.StartImmediately, &c.TimeToStart, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt)
+		&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.AttachmentURL, &c.AttachmentName, &c.Deleted, &c.StartImmediately, &c.TimeToStart, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}

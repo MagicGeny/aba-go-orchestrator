@@ -1,0 +1,2 @@
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS attachment_path VARCHAR(1024);
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS attachment_name VARCHAR(255);

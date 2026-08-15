@@ -3,11 +3,13 @@ package transport
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
@@ -70,11 +72,29 @@ func (h *HTTPHandler) UploadCampaign(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
+	var attachmentReader io.Reader
+	var attachmentFilename string
+	attachmentFile, attachmentHeader, err := r.FormFile("attachment")
+	if err != nil && errors.Is(err, http.ErrMissingFile) {
+		attachmentFile, attachmentHeader, err = r.FormFile("file")
+	}
+	if err != nil && !errors.Is(err, http.ErrMissingFile) {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if attachmentFile != nil {
+		defer attachmentFile.Close()
+		attachmentReader = attachmentFile
+		if attachmentHeader != nil {
+			attachmentFilename = attachmentHeader.Filename
+		}
+	}
+
 	// Create independent context
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	campaignID, err := h.campaignUC.UploadCampaign(ctx, tenantID, name, template, startImmediately, timeToStart, file, header.Filename)
+	campaignID, err := h.campaignUC.UploadCampaign(ctx, tenantID, name, template, startImmediately, timeToStart, file, header.Filename, attachmentReader, attachmentFilename)
 	if err != nil {
 		log.Printf("UploadCampaign error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -83,6 +103,44 @@ func (h *HTTPHandler) UploadCampaign(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"id": campaignID})
+}
+
+func (h *HTTPHandler) CampaignSubroutes(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/campaigns/")
+	path = strings.Trim(path, "/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 2 && parts[1] == "attachment" {
+		campaignID, err := uuid.Parse(parts[0])
+		if err != nil {
+			http.Error(w, "invalid campaign_id", http.StatusBadRequest)
+			return
+		}
+		h.DownloadCampaignAttachment(w, r, campaignID)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func (h *HTTPHandler) DownloadCampaignAttachment(w http.ResponseWriter, r *http.Request, campaignID uuid.UUID) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	campaign, err := h.campaignUC.GetCampaign(ctx, campaignID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if campaign.AttachmentURL == nil || *campaign.AttachmentURL == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	http.Redirect(w, r, *campaign.AttachmentURL, http.StatusFound)
 }
 
 func (h *HTTPHandler) StopCampaign(w http.ResponseWriter, r *http.Request) {

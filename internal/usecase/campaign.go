@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/storage"
 	"github.com/google/uuid"
 	"github.com/xuri/excelize/v2"
 )
@@ -22,11 +24,12 @@ import (
 const uploadDir = "uploads"
 
 type CampaignUseCase struct {
-	repo domain.CampaignRepository
+	repo            domain.CampaignRepository
+	attachmentStore storage.AttachmentStore
 }
 
-func NewCampaignUseCase(repo domain.CampaignRepository) *CampaignUseCase {
-	return &CampaignUseCase{repo: repo}
+func NewCampaignUseCase(repo domain.CampaignRepository, attachmentStore storage.AttachmentStore) *CampaignUseCase {
+	return &CampaignUseCase{repo: repo, attachmentStore: attachmentStore}
 }
 
 func (uc *CampaignUseCase) GetCampaign(ctx context.Context, id uuid.UUID) (*domain.Campaign, error) {
@@ -97,7 +100,7 @@ func generateSemanticFilename(campaignName string, createdAt time.Time, original
 		originalExt)
 }
 
-func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUID, name, template string, startImmediately bool, timeToStart *time.Time, excelReader io.Reader, originalName string) (uuid.UUID, error) {
+func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUID, name, template string, startImmediately bool, timeToStart *time.Time, excelReader io.Reader, originalName string, attachmentReader io.Reader, attachmentName string) (uuid.UUID, error) {
 	// Ensure upload directory exists
 	if err := os.MkdirAll(uploadDir, 0755); err != nil {
 		return uuid.Nil, fmt.Errorf("failed to create upload directory: %w", err)
@@ -151,6 +154,32 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 		return uuid.Nil, fmt.Errorf("failed to save original file: %w", err)
 	}
 
+	var attachmentURL *string
+	var attachmentOriginalName *string
+	if attachmentReader != nil {
+		if uc.attachmentStore == nil {
+			_ = os.Remove(originalFilePath)
+			return uuid.Nil, fmt.Errorf("attachment storage is not configured")
+		}
+
+		ext := filepath.Ext(attachmentName)
+		if ext == "" {
+			ext = ".bin"
+		}
+		attachmentFilename := generateSemanticFilename(fmt.Sprintf("%s-attachment", name), createdAt, ext)
+		objectKey := filepath.ToSlash(filepath.Join(campaignID.String(), attachmentFilename))
+
+		url, err := uc.attachmentStore.Put(ctx, objectKey, attachmentReader, "application/octet-stream")
+		if err != nil {
+			_ = os.Remove(originalFilePath)
+			return uuid.Nil, fmt.Errorf("failed to upload attachment: %w", err)
+		}
+		attachmentURL = &url
+		if attachmentName != "" {
+			attachmentOriginalName = &attachmentName
+		}
+	}
+
 	// Set initial status based on start_immediately flag
 	// If startImmediately is true, the campaign starts right away.
 	// If false, it stays in draft and will be picked up by the poller when time_to_start arrives.
@@ -168,6 +197,8 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 		OriginalExcelName:  originalName,
 		OriginalExcelPath:  &originalFilePath,
 		ProcessedExcelPath: nil, // Will be generated later
+		AttachmentURL:      attachmentURL,
+		AttachmentName:     attachmentOriginalName,
 		Deleted:            false,
 		StartImmediately:   startImmediately,
 		TimeToStart:        timeToStart,
@@ -257,9 +288,29 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 			// Replace {user} in message template
 			messageText := strings.ReplaceAll(campaign.MessageTemplate, "{user_name}", target.ClientName)
 
-			// Create outbox message for each target
-			payload := fmt.Sprintf(`{"task_id":"%s", "campaign_id":"%s", "tenant_id":"%s", "messenger":"max", "phone":"%s", "message_text":%q}`,
-				target.ID, campaign.ID, campaign.TenantID, target.PhoneNormalized, messageText)
+			payload, err := json.Marshal(struct {
+				TaskID         string  `json:"task_id"`
+				CampaignID     string  `json:"campaign_id"`
+				TenantID       string  `json:"tenant_id"`
+				Messenger      string  `json:"messenger"`
+				Phone          string  `json:"phone"`
+				MessageText    string  `json:"message_text"`
+				AttachmentURL  *string `json:"attachment_url,omitempty"`
+				AttachmentName *string `json:"attachment_name,omitempty"`
+			}{
+				TaskID:         target.ID.String(),
+				CampaignID:     campaign.ID.String(),
+				TenantID:       campaign.TenantID.String(),
+				Messenger:      "max",
+				Phone:          target.PhoneNormalized,
+				MessageText:    messageText,
+				AttachmentURL:  campaign.AttachmentURL,
+				AttachmentName: campaign.AttachmentName,
+			})
+			if err != nil {
+				_ = os.Remove(originalFilePath)
+				return uuid.Nil, err
+			}
 
 			outboxID, err := uuid.NewV7()
 			if err != nil {
@@ -269,7 +320,7 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 			outbox = append(outbox, &domain.OutboxMessage{
 				ID:        outboxID,
 				EventType: "message.send",
-				Payload:   []byte(payload),
+				Payload:   payload,
 				Status:    "pending",
 			})
 		}

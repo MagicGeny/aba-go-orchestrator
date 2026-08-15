@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -20,13 +22,19 @@ import (
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/blocklist"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/repository"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/storage"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/transport"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/usecase"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/worker"
 )
 
 func main() {
+	// Load .env from the current working directory, and from the executable's
+	// directory. Both attempts are best-effort.
 	_ = godotenv.Load()
+	if exe, err := os.Executable(); err == nil {
+		_ = godotenv.Load(filepath.Join(filepath.Dir(exe), ".env"))
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -58,7 +66,59 @@ func main() {
 
 	// 3. Initialize layers
 	repo := repository.NewPostgresRepository(pool)
-	campaignUC := usecase.NewCampaignUseCase(repo)
+	var attachmentStore storage.AttachmentStore
+	{
+		endpoint := os.Getenv("SEAWEED_S3_ENDPOINT")
+		if endpoint == "" {
+			endpoint = "http://127.0.0.1:8333"
+		}
+		bucket := os.Getenv("SEAWEED_S3_BUCKET")
+		if bucket == "" {
+			bucket = "campaign-attachments"
+		}
+		region := os.Getenv("SEAWEED_S3_REGION")
+		accessKey := os.Getenv("SEAWEED_S3_ACCESS_KEY")
+		secretKey := os.Getenv("SEAWEED_S3_SECRET_KEY")
+		publicBaseURL := os.Getenv("SEAWEED_S3_PUBLIC_BASE_URL")
+		submitURL := os.Getenv("SEAWEED_SUBMIT_URL")
+		if submitURL == "" {
+			// Default: SeaweedFS filer multipart upload endpoint (port 8888).
+			// NOTE: do NOT default to 8080 — the orchestrator runs there.
+			submitURL = "http://localhost:8888/" + bucket + "/"
+		}
+		httpPublic := os.Getenv("SEAWEED_HTTP_PUBLIC_BASE_URL")
+		if httpPublic == "" {
+			// Default to the filer's host:port (the filer serves both uploads
+			// and downloads). This is derived from the submit URL so the two
+			// are always in sync.
+			httpPublic = deriveHost(submitURL)
+		}
+		if httpPublic == "" {
+			httpPublic = endpoint
+		}
+		forceHTTP, _ := strconv.ParseBool(os.Getenv("SEAWEED_FORCE_HTTP_UPLOAD"))
+
+		store, err := storage.NewS3Store(ctx, storage.S3StoreConfig{
+			Endpoint:          endpoint,
+			Region:            region,
+			Bucket:            bucket,
+			AccessKey:         accessKey,
+			SecretKey:         secretKey,
+			PublicBaseURL:     publicBaseURL,
+			SeaweedSubmitURL:  submitURL,
+			ForceHTTPUpload:   forceHTTP,
+			HTTPPublicBaseURL: httpPublic,
+		})
+		if err != nil {
+			log.Printf("attachment store init failed: %v", err)
+		} else {
+			log.Printf("attachment store: submit=%s public_base=%s s3_endpoint=%s forceHTTP=%v",
+				submitURL, httpPublic, endpoint, forceHTTP)
+			attachmentStore = store
+		}
+	}
+
+	campaignUC := usecase.NewCampaignUseCase(repo, attachmentStore)
 	hub := transport.NewHub()
 
 	// 4. Start Workers
@@ -96,6 +156,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/campaigns/upload", handler.UploadCampaign)
 	mux.HandleFunc("/api/v1/campaigns", handler.ListCampaigns)
+	mux.HandleFunc("/api/v1/campaigns/", handler.CampaignSubroutes)
 	mux.HandleFunc("/api/v1/campaigns/trigger-polling", handler.TriggerPolling)
 	mux.HandleFunc("/api/v1/campaigns/stream", hub.HandleStream)
 	mux.HandleFunc("/api/v1/workers/callback", handler.WorkerCallback)
@@ -170,7 +231,27 @@ func runMigrations(dbURL string) {
 	log.Println("Migrations applied successfully (or already up to date)!")
 }
 
-/*"github.com/aba/orchestrator/internal/repository"
-"github.com/aba/orchestrator/internal/transport"
-"github.com/aba/orchestrator/internal/usecase"
-"github.com/aba/orchestrator/internal/worker"*/
+// deriveHost extracts the scheme + host[:port] from a URL, returning an empty
+// string if the URL is malformed. Used to default the public base URL to the
+// same host:port as the SeaweedFS filer submit URL.
+func deriveHost(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	// Trim any path after the host.
+	for i := 0; i < len(rawURL); i++ {
+		if rawURL[i] == '/' && i > 0 && rawURL[i-1] == '/' {
+			// found "//"; the host begins at i+1
+			rest := rawURL[i+2:]
+			end := len(rest)
+			for j := 0; j < len(rest); j++ {
+				if rest[j] == '/' {
+					end = j
+					break
+				}
+			}
+			return rawURL[:i+2] + rest[:end]
+		}
+	}
+	return ""
+}

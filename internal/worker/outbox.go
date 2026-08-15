@@ -89,12 +89,14 @@ func (w *OutboxWorker) processMessages(ctx context.Context) {
 
 	for _, msg := range messages {
 		var sendTask struct {
-			TaskID      string `json:"task_id"`
-			CampaignID  string `json:"campaign_id"`
-			TenantID    string `json:"tenant_id"`
-			Messenger   string `json:"messenger"`
-			Phone       string `json:"phone"`
-			MessageText string `json:"message_text"`
+			TaskID         string  `json:"task_id"`
+			CampaignID     string  `json:"campaign_id"`
+			TenantID       string  `json:"tenant_id"`
+			Messenger      string  `json:"messenger"`
+			Phone          string  `json:"phone"`
+			MessageText    string  `json:"message_text"`
+			AttachmentURL  *string `json:"attachment_url,omitempty"`
+			AttachmentName *string `json:"attachment_name,omitempty"`
 		}
 		_ = json.Unmarshal(msg.Payload, &sendTask)
 
@@ -136,6 +138,9 @@ func (w *OutboxWorker) processMessages(ctx context.Context) {
 			}
 		}
 
+		log.Printf("[outbox] publishing message id=%s task_id=%s campaign_id=%s phone=%s attachment_url=%q attachment_name=%q payload=%s",
+			msg.ID, sendTask.TaskID, sendTask.CampaignID, sendTask.Phone,
+			strDeref(sendTask.AttachmentURL), strDeref(sendTask.AttachmentName), string(msg.Payload))
 		pubErr := w.amqpChan.PublishWithContext(ctx,
 			"",          // exchange
 			w.queueName, // routing key
@@ -173,4 +178,11 @@ func (w *OutboxWorker) processMessages(ctx context.Context) {
 			log.Printf("failed to mark message %s as processed: %v", id, err)
 		}
 	}
+}
+
+func strDeref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }

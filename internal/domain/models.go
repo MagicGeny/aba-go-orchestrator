@@ -80,6 +80,8 @@ type Campaign struct {
 	OriginalExcelName  string         `json:"original_excel_name"`
 	OriginalExcelPath  *string        `json:"-"` // Don't serialize to JSON
 	ProcessedExcelPath *string        `json:"-"` // Don't serialize to JSON
+	AttachmentURL      *string        `json:"attachment_url,omitempty"`
+	AttachmentName     *string        `json:"attachment_name,omitempty"`
 	Deleted            bool           `json:"deleted"`
 	StartImmediately   bool           `json:"start_immediately"`
 	TimeToStart        *time.Time     `json:"time_to_start"`
