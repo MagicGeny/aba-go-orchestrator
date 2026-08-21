@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MagicGeny/aba-go-orchestrator/internal/config"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/storage"
 	"github.com/google/uuid"
@@ -26,10 +26,11 @@ const uploadDir = "uploads"
 type CampaignUseCase struct {
 	repo            domain.CampaignRepository
 	attachmentStore storage.AttachmentStore
+	cfg             config.Config
 }
 
-func NewCampaignUseCase(repo domain.CampaignRepository, attachmentStore storage.AttachmentStore) *CampaignUseCase {
-	return &CampaignUseCase{repo: repo, attachmentStore: attachmentStore}
+func NewCampaignUseCase(repo domain.CampaignRepository, attachmentStore storage.AttachmentStore, cfg config.Config) *CampaignUseCase {
+	return &CampaignUseCase{repo: repo, attachmentStore: attachmentStore, cfg: cfg}
 }
 
 func (uc *CampaignUseCase) GetCampaign(ctx context.Context, id uuid.UUID) (*domain.Campaign, error) {
@@ -235,6 +236,7 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 					CampaignID:      campaignID,
 					ClientName:      row.name,
 					PhoneNormalized: phone,
+					MessengerType:   domain.DefaultMessengerType,
 					ExcelRowIndex:   row.index,
 					Status:          domain.TaskStatusPending,
 				}
@@ -276,54 +278,9 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 	}()
 
 	var targets []*domain.CampaignTarget
-	var outbox []*domain.OutboxMessage
 
 	for target := range results {
 		targets = append(targets, target)
-
-		// Only create outbox messages if starting immediately.
-		// For scheduled campaigns, outbox messages will be created
-		// when the poller transitions the campaign from draft to processing.
-		if startImmediately {
-			// Replace {user} in message template
-			messageText := strings.ReplaceAll(campaign.MessageTemplate, "{user_name}", target.ClientName)
-
-			payload, err := json.Marshal(struct {
-				TaskID         string  `json:"task_id"`
-				CampaignID     string  `json:"campaign_id"`
-				TenantID       string  `json:"tenant_id"`
-				Messenger      string  `json:"messenger"`
-				Phone          string  `json:"phone"`
-				MessageText    string  `json:"message_text"`
-				AttachmentURL  *string `json:"attachment_url,omitempty"`
-				AttachmentName *string `json:"attachment_name,omitempty"`
-			}{
-				TaskID:         target.ID.String(),
-				CampaignID:     campaign.ID.String(),
-				TenantID:       campaign.TenantID.String(),
-				Messenger:      "max",
-				Phone:          target.PhoneNormalized,
-				MessageText:    messageText,
-				AttachmentURL:  campaign.AttachmentURL,
-				AttachmentName: campaign.AttachmentName,
-			})
-			if err != nil {
-				_ = os.Remove(originalFilePath)
-				return uuid.Nil, err
-			}
-
-			outboxID, err := uuid.NewV7()
-			if err != nil {
-				outboxID = uuid.New()
-			}
-
-			outbox = append(outbox, &domain.OutboxMessage{
-				ID:        outboxID,
-				EventType: "message.send",
-				Payload:   payload,
-				Status:    "pending",
-			})
-		}
 	}
 
 	select {
@@ -334,7 +291,36 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 
 	campaign.TotalCount = len(targets)
 
-	if err := uc.repo.CreateCampaign(ctx, campaign, targets, outbox); err != nil {
+	phones := make([]string, 0, len(targets))
+	for _, t := range targets {
+		phones = append(phones, t.PhoneNormalized)
+	}
+	mappedCount, err := uc.repo.CountMappedPhones(ctx, tenantID, domain.DefaultMessengerType, phones)
+	if err != nil {
+		_ = os.Remove(originalFilePath)
+		return uuid.Nil, fmt.Errorf("failed to count warm contacts: %w", err)
+	}
+	coldCount := len(targets) - mappedCount
+	if coldCount < 0 {
+		coldCount = 0
+	}
+	avg := uc.cfg.LimitColdEstimatedAvg
+	if avg <= 0 {
+		avg = 41
+	}
+	estimatedDays := (coldCount + avg - 1) / avg
+	if estimatedDays < 1 {
+		estimatedDays = 1
+	}
+	campaign.EstimatedDays = &estimatedDays
+	startAt := createdAt
+	if !startImmediately && timeToStart != nil {
+		startAt = *timeToStart
+	}
+	completion := startAt.AddDate(0, 0, estimatedDays)
+	campaign.ScheduledCompletionDate = &completion
+
+	if err := uc.repo.CreateCampaign(ctx, campaign, targets, nil); err != nil {
 		// Clean up the uploaded file if campaign creation fails
 		_ = os.Remove(originalFilePath)
 		return uuid.Nil, err
@@ -485,7 +471,13 @@ func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UU
 
 		if ok {
 			statusText = target.Status.StatusText()
-			if target.LastError != nil && target.Status == domain.TaskStatusFailed {
+			if target.Status == domain.TaskStatusUserNotFoundByPhone {
+				messenger := target.MessengerType
+				if messenger == "" {
+					messenger = domain.DefaultMessengerType
+				}
+				statusText = fmt.Sprintf("User not found in %s", messenger)
+			} else if target.LastError != nil && target.Status == domain.TaskStatusFailed {
 				statusText = fmt.Sprintf("%s: %s", statusText, *target.LastError)
 			}
 

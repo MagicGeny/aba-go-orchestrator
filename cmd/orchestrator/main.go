@@ -21,6 +21,7 @@ import (
 	"github.com/rabbitmq/amqp091-go"
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/blocklist"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/config"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/repository"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/storage"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/transport"
@@ -118,18 +119,22 @@ func main() {
 		}
 	}
 
-	campaignUC := usecase.NewCampaignUseCase(repo, attachmentStore)
+	cfg := config.LoadFromEnv()
+	campaignUC := usecase.NewCampaignUseCase(repo, attachmentStore, cfg)
 	hub := transport.NewHub()
 
 	// 4. Start Workers
 	blocklistCache := blocklist.NewCache(repo, 10*time.Minute)
 	go blocklistCache.Run(ctx)
 
-	outboxWorker, err := worker.NewOutboxWorker(repo, amqpConn, "tasks.messages.send", "tasks.messages.results_replies_queue", blocklistCache)
+	outboxWorker, err := worker.NewOutboxWorker(repo, amqpConn, worker.QueueSend, worker.QueueSendExistingChat, "tasks.messages.results_replies_queue", blocklistCache)
 	if err != nil {
 		log.Fatalf("failed to init outbox worker: %v", err)
 	}
 	go outboxWorker.Run(ctx)
+
+	campaignDoser := worker.NewCampaignDoser(repo, cfg)
+	go campaignDoser.Run(ctx)
 
 	schedulerWorker := worker.NewSchedulerWorker(repo)
 	go schedulerWorker.Run(ctx)

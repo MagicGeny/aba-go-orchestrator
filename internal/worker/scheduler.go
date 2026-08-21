@@ -9,8 +9,9 @@ import (
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
 )
 
-// SchedulerWorker checks every ~1 second for scheduled campaigns whose
-// time_to_start has arrived and starts them by creating outbox messages.
+// SchedulerWorker checks every ~2 seconds for scheduled campaigns whose
+// time_to_start has arrived and transitions them to processing.
+// Per-tenant dosing is handled by CampaignDoser.
 type SchedulerWorker struct {
 	repo      domain.CampaignRepository
 	mu        sync.Mutex

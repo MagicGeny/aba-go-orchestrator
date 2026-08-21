@@ -2,7 +2,6 @@ package repository
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -31,9 +30,9 @@ func (r *PostgresRepository) CreateCampaign(ctx context.Context, campaign *domai
 
 	// Insert campaign
 	_, err = tx.Exec(ctx, `
-		INSERT INTO campaigns (id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, attachment_url, attachment_name, total_count, start_immediately, time_to_start)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-		campaign.ID, campaign.TenantID, campaign.Name, campaign.MessageTemplate, campaign.Status, campaign.OriginalExcelName, campaign.OriginalExcelPath, campaign.ProcessedExcelPath, campaign.AttachmentURL, campaign.AttachmentName, campaign.TotalCount, campaign.StartImmediately, campaign.TimeToStart)
+		INSERT INTO campaigns (id, tenant_id, name, message_template, status, original_excel_name, original_excel_path, processed_excel_path, attachment_url, attachment_name, total_count, start_immediately, time_to_start, estimated_days, scheduled_completion_date, fallback_to_vk_allowed)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+		campaign.ID, campaign.TenantID, campaign.Name, campaign.MessageTemplate, campaign.Status, campaign.OriginalExcelName, campaign.OriginalExcelPath, campaign.ProcessedExcelPath, campaign.AttachmentURL, campaign.AttachmentName, campaign.TotalCount, campaign.StartImmediately, campaign.TimeToStart, campaign.EstimatedDays, campaign.ScheduledCompletionDate, campaign.FallbackToVKAllowed)
 	if err != nil {
 		return fmt.Errorf("failed to insert campaign: %w", err)
 	}
@@ -41,33 +40,38 @@ func (r *PostgresRepository) CreateCampaign(ctx context.Context, campaign *domai
 	// Bulk insert targets using CopyFrom
 	targetRows := make([][]any, len(targets))
 	for i, t := range targets {
-		targetRows[i] = []any{t.ID, t.CampaignID, t.ClientName, t.PhoneNormalized, t.ExcelRowIndex, t.Status}
+		messengerType := t.MessengerType
+		if messengerType == "" {
+			messengerType = domain.DefaultMessengerType
+		}
+		targetRows[i] = []any{t.ID, t.CampaignID, t.ClientName, t.PhoneNormalized, t.ExcelRowIndex, t.Status, messengerType}
 	}
 
 	_, err = tx.CopyFrom(
 		ctx,
 		pgx.Identifier{"campaign_targets"},
-		[]string{"id", "campaign_id", "client_name", "phone_normalized", "excel_row_index", "status"},
+		[]string{"id", "campaign_id", "client_name", "phone_normalized", "excel_row_index", "status", "messenger_type"},
 		pgx.CopyFromRows(targetRows),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to bulk insert targets: %w", err)
 	}
 
-	// Bulk insert outbox messages
-	outboxRows := make([][]any, len(outbox))
-	for i, m := range outbox {
-		outboxRows[i] = []any{m.ID, m.EventType, m.Payload, m.Status}
-	}
+	if len(outbox) > 0 {
+		outboxRows := make([][]any, len(outbox))
+		for i, m := range outbox {
+			outboxRows[i] = []any{m.ID, m.EventType, m.Payload, m.Status}
+		}
 
-	_, err = tx.CopyFrom(
-		ctx,
-		pgx.Identifier{"outbox_messages"},
-		[]string{"id", "event_type", "payload", "status"},
-		pgx.CopyFromRows(outboxRows),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to bulk insert outbox: %w", err)
+		_, err = tx.CopyFrom(
+			ctx,
+			pgx.Identifier{"outbox_messages"},
+			[]string{"id", "event_type", "payload", "status"},
+			pgx.CopyFromRows(outboxRows),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to bulk insert outbox: %w", err)
+		}
 	}
 
 	return tx.Commit(ctx)
@@ -119,7 +123,7 @@ func (r *PostgresRepository) UpdateCampaignStatus(ctx context.Context, id uuid.U
 
 func (r *PostgresRepository) GetCampaignTargets(ctx context.Context, campaignID uuid.UUID) ([]*domain.CampaignTarget, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, campaign_id, client_name, phone_normalized, excel_row_index, status, last_error, sent_at, replied_at, last_reply_text, created_at, updated_at
+		SELECT id, campaign_id, client_name, phone_normalized, excel_row_index, status, last_error, sent_at, replied_at, last_reply_text, created_at, updated_at, COALESCE(messenger_type, 'MAX')
 		FROM campaign_targets WHERE campaign_id = $1 ORDER BY excel_row_index ASC`, campaignID)
 	if err != nil {
 		return nil, err
@@ -129,7 +133,7 @@ func (r *PostgresRepository) GetCampaignTargets(ctx context.Context, campaignID 
 	var targets []*domain.CampaignTarget
 	for rows.Next() {
 		var t domain.CampaignTarget
-		err := rows.Scan(&t.ID, &t.CampaignID, &t.ClientName, &t.PhoneNormalized, &t.ExcelRowIndex, &t.Status, &t.LastError, &t.SentAt, &t.RepliedAt, &t.LastReplyText, &t.CreatedAt, &t.UpdatedAt)
+		err := rows.Scan(&t.ID, &t.CampaignID, &t.ClientName, &t.PhoneNormalized, &t.ExcelRowIndex, &t.Status, &t.LastError, &t.SentAt, &t.RepliedAt, &t.LastReplyText, &t.CreatedAt, &t.UpdatedAt, &t.MessengerType)
 		if err != nil {
 			return nil, err
 		}
@@ -184,7 +188,8 @@ func (r *PostgresRepository) GetPendingMessages(ctx context.Context, limit int) 
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, event_type, payload, status, created_at
 		FROM outbox_messages 
-		WHERE status = 'pending' 
+		WHERE status = 'pending' AND publish_at <= NOW()
+		ORDER BY publish_at ASC
 		FOR UPDATE SKIP LOCKED 
 		LIMIT $1`, limit)
 	if err != nil {
@@ -243,8 +248,12 @@ func (r *PostgresRepository) UpdateTargetStatus(ctx context.Context, targetID uu
 	}
 
 	now := time.Now().UTC()
-	err = tx.QueryRow(ctx, "UPDATE campaign_targets SET status = $1, last_error = $2, sent_at = COALESCE($3, sent_at), updated_at = $4 WHERE id = $5 RETURNING campaign_id, status",
-		status, lastError, finalSentAt, now, targetID).Scan(&campaignID, &oldStatus)
+	err = tx.QueryRow(ctx, "SELECT campaign_id, status FROM campaign_targets WHERE id = $1 FOR UPDATE", targetID).Scan(&campaignID, &oldStatus)
+	if err != nil {
+		return nil, err
+	}
+	_, err = tx.Exec(ctx, "UPDATE campaign_targets SET status = $1, last_error = $2, sent_at = COALESCE($3, sent_at), updated_at = $4 WHERE id = $5",
+		status, lastError, finalSentAt, now, targetID)
 	if err != nil {
 		return nil, err
 	}
@@ -252,10 +261,10 @@ func (r *PostgresRepository) UpdateTargetStatus(ctx context.Context, targetID uu
 	// Update campaign counters
 	var query string
 	var args []interface{}
-	if status == domain.TaskStatusDelivered {
+	if status == domain.TaskStatusDelivered && oldStatus != domain.TaskStatusDelivered {
 		query = "UPDATE campaigns SET processed_count = processed_count + 1, updated_at = $1 WHERE id = $2 RETURNING id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, attachment_url, attachment_name, deleted, start_immediately, time_to_start"
 		args = []interface{}{now, campaignID}
-	} else if status == domain.TaskStatusFailed {
+	} else if status.IsErrorStatus() && !oldStatus.IsErrorStatus() {
 		query = "UPDATE campaigns SET error_count = error_count + 1, updated_at = $1 WHERE id = $2 RETURNING id, tenant_id, name, message_template, status, original_excel_name, processed_count, total_count, error_count, created_at, updated_at, original_excel_path, processed_excel_path, attachment_url, attachment_name, deleted, start_immediately, time_to_start"
 		args = []interface{}{now, campaignID}
 	} else {
@@ -343,12 +352,12 @@ func (r *PostgresRepository) GetCampaignTargetByID(ctx context.Context, targetID
 	var t domain.CampaignTarget
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, campaign_id, client_name, phone_normalized, excel_row_index, status,
-			last_error, sent_at, replied_at, last_reply_text, created_at, updated_at
+			last_error, sent_at, replied_at, last_reply_text, created_at, updated_at, COALESCE(messenger_type, 'MAX')
 		FROM campaign_targets
 		WHERE id = $1
 	`, targetID).Scan(
 		&t.ID, &t.CampaignID, &t.ClientName, &t.PhoneNormalized, &t.ExcelRowIndex,
-		&t.Status, &t.LastError, &t.SentAt, &t.RepliedAt, &t.LastReplyText, &t.CreatedAt, &t.UpdatedAt,
+		&t.Status, &t.LastError, &t.SentAt, &t.RepliedAt, &t.LastReplyText, &t.CreatedAt, &t.UpdatedAt, &t.MessengerType,
 	)
 	if err != nil {
 		return nil, err
@@ -392,105 +401,16 @@ func (r *PostgresRepository) StopCampaign(ctx context.Context, campaignID uuid.U
 }
 
 func (r *PostgresRepository) StartCampaign(ctx context.Context, campaignID uuid.UUID) error {
-	// Get the campaign with its targets and message template
-	campaign, err := r.GetCampaign(ctx, campaignID)
-	if err != nil {
-		return fmt.Errorf("failed to get campaign: %w", err)
-	}
-
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	// Update campaign status to processing
 	now := time.Now().UTC()
-	tag, err := tx.Exec(ctx, "UPDATE campaigns SET status = $1, updated_at = $2 WHERE id = $3 AND status = $4",
+	_, err := r.pool.Exec(ctx, `
+		UPDATE campaigns
+		SET status = $1, updated_at = $2
+		WHERE id = $3 AND status = $4`,
 		domain.CampaignStatusProcessing, now, campaignID, domain.CampaignStatusDraft)
 	if err != nil {
-		return fmt.Errorf("failed to update campaign status: %w", err)
+		return fmt.Errorf("failed to start campaign: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return nil
-	}
-
-	// Create outbox messages for all pending targets
-	rows, err := tx.Query(ctx, `SELECT id, client_name, phone_normalized FROM campaign_targets WHERE campaign_id = $1`, campaignID)
-	if err != nil {
-		return fmt.Errorf("failed to query targets: %w", err)
-	}
-	defer rows.Close()
-
-	const chunkSize = 1000
-	chunk := make([][]any, 0, chunkSize)
-	for rows.Next() {
-		var targetID uuid.UUID
-		var clientName string
-		var phoneNormalized string
-		if err := rows.Scan(&targetID, &clientName, &phoneNormalized); err != nil {
-			return fmt.Errorf("failed to scan target: %w", err)
-		}
-
-		messageText := strings.ReplaceAll(campaign.MessageTemplate, "{user_name}", clientName)
-		payload, err := json.Marshal(struct {
-			TaskID         string  `json:"task_id"`
-			CampaignID     string  `json:"campaign_id"`
-			TenantID       string  `json:"tenant_id"`
-			Messenger      string  `json:"messenger"`
-			Phone          string  `json:"phone"`
-			MessageText    string  `json:"message_text"`
-			AttachmentURL  *string `json:"attachment_url,omitempty"`
-			AttachmentName *string `json:"attachment_name,omitempty"`
-		}{
-			TaskID:         targetID.String(),
-			CampaignID:     campaign.ID.String(),
-			TenantID:       campaign.TenantID.String(),
-			Messenger:      "max",
-			Phone:          phoneNormalized,
-			MessageText:    messageText,
-			AttachmentURL:  campaign.AttachmentURL,
-			AttachmentName: campaign.AttachmentName,
-		})
-		if err != nil {
-			return err
-		}
-
-		outboxID, err := uuid.NewV7()
-		if err != nil {
-			outboxID = uuid.New()
-		}
-		chunk = append(chunk, []any{outboxID, "message.send", payload, "pending"})
-
-		if len(chunk) >= chunkSize {
-			_, err := tx.CopyFrom(
-				ctx,
-				pgx.Identifier{"outbox_messages"},
-				[]string{"id", "event_type", "payload", "status"},
-				pgx.CopyFromRows(chunk),
-			)
-			if err != nil {
-				return fmt.Errorf("failed to bulk insert outbox: %w", err)
-			}
-			chunk = chunk[:0]
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("failed to iterate targets: %w", err)
-	}
-	if len(chunk) > 0 {
-		_, err := tx.CopyFrom(
-			ctx,
-			pgx.Identifier{"outbox_messages"},
-			[]string{"id", "event_type", "payload", "status"},
-			pgx.CopyFromRows(chunk),
-		)
-		if err != nil {
-			return fmt.Errorf("failed to bulk insert outbox: %w", err)
-		}
-	}
-
-	return tx.Commit(ctx)
+	return nil
 }
 
 func (r *PostgresRepository) GetRepliesByCampaign(ctx context.Context, campaignID uuid.UUID) ([]*domain.CampaignReply, error) {
@@ -642,27 +562,54 @@ func (r *PostgresRepository) UpsertChatPhoneMapping(ctx context.Context, mapping
 	}
 
 	_, err := r.pool.Exec(ctx, `
-		INSERT INTO chat_phone_mappings (id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO chat_phone_mappings (id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at, tenant_id, messenger_type)
+		SELECT $1, $2, $3, $4, $5, $6, $7, $8, c.tenant_id, COALESCE(NULLIF($9, ''), ct.messenger_type, 'MAX')
+		FROM campaigns c
+		JOIN campaign_targets ct ON ct.id = $4 AND ct.campaign_id = c.id
+		WHERE c.id = $3
 		ON CONFLICT (chat_id) DO UPDATE
 		SET campaign_id = EXCLUDED.campaign_id,
 			campaign_target_id = EXCLUDED.campaign_target_id,
 			phone_normalized = EXCLUDED.phone_normalized,
 			viewer_id = EXCLUDED.viewer_id,
+			tenant_id = EXCLUDED.tenant_id,
+			messenger_type = EXCLUDED.messenger_type,
 			updated_at = EXCLUDED.updated_at
-	`, mapping.ID, mapping.ChatID, mapping.CampaignID, mapping.CampaignTargetID, mapping.PhoneNormalized, mapping.ViewerID, mapping.CreatedAt, mapping.UpdatedAt)
-	return err
+	`, mapping.ID, mapping.ChatID, mapping.CampaignID, mapping.CampaignTargetID, mapping.PhoneNormalized, mapping.ViewerID, mapping.CreatedAt, mapping.UpdatedAt, mapping.MessengerType)
+	if err == nil {
+		return nil
+	}
+
+	_, err2 := r.pool.Exec(ctx, `
+		UPDATE chat_phone_mappings m
+		SET chat_id = $1,
+			campaign_id = $2,
+			campaign_target_id = $3,
+			viewer_id = $4,
+			updated_at = $5
+		FROM campaigns c
+		JOIN campaign_targets ct ON ct.id = $3 AND ct.campaign_id = c.id
+		WHERE m.tenant_id = c.tenant_id
+		  AND m.phone_normalized = $6
+		  AND m.messenger_type = COALESCE(NULLIF($7, ''), ct.messenger_type, 'MAX')
+	`, mapping.ChatID, mapping.CampaignID, mapping.CampaignTargetID, mapping.ViewerID, mapping.UpdatedAt, mapping.PhoneNormalized, mapping.MessengerType)
+	if err2 != nil {
+		return fmt.Errorf("upsert chat mapping: %w (fallback: %v)", err, err2)
+	}
+	return nil
 }
 
 func (r *PostgresRepository) GetChatPhoneMappingByChatID(ctx context.Context, chatID string) (*domain.ChatPhoneMapping, error) {
 	var m domain.ChatPhoneMapping
 	var viewerID *int64
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at
+		SELECT id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at,
+			tenant_id, COALESCE(messenger_type, 'MAX')
 		FROM chat_phone_mappings
 		WHERE chat_id = $1
 	`, chatID).Scan(
 		&m.ID, &m.ChatID, &m.CampaignID, &m.CampaignTargetID, &m.PhoneNormalized, &viewerID, &m.CreatedAt, &m.UpdatedAt,
+		&m.TenantID, &m.MessengerType,
 	)
 	if err != nil {
 		return nil, err

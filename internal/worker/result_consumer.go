@@ -300,6 +300,13 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				log.Printf("ResultConsumer: failed to update target %s status to %s: %v", result.TargetID, result.Status, err)
 				processedOK = false
 			}
+		} else if result.Status == domain.TaskStatusUserNotFoundByPhone {
+			log.Printf("ResultConsumer: USER_NOT_FOUND_BY_PHONE for target %s (cold search already counted in tenant quota at enqueue)", result.TargetID)
+			_, err := rc.repo.UpdateTargetStatus(processCtx, result.TargetID, domain.TaskStatusUserNotFoundByPhone, result.ErrorMessage, nil)
+			if err != nil {
+				log.Printf("ResultConsumer: failed to update target %s status to %s: %v", result.TargetID, result.Status, err)
+				processedOK = false
+			}
 		} else if result.Status != "" {
 			_, err := rc.repo.UpdateTargetStatus(processCtx, result.TargetID, domain.TaskStatus(result.Status), result.ErrorMessage, nil)
 			if err != nil {
