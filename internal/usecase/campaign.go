@@ -487,12 +487,12 @@ func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UU
 					log.Printf("GenerateExcel: Row %d - setting reply text to: %s", rowNum, replyText)
 				}
 				if target.RepliedAt != nil {
-					replyTimeText = target.RepliedAt.Format("2006-01-02 15:04:05")
+					replyTimeText = target.RepliedAt.In(uc.cfg.Location).Format("2006-01-02 15:04:05")
 				}
 			} else if target.Status == domain.TaskStatusViewed {
 				replyText = "ПРОЧИТАНО"
 				// For viewed, use the last updated time as the time
-				replyTimeText = target.UpdatedAt.Format("2006-01-02 15:04:05")
+				replyTimeText = target.UpdatedAt.In(uc.cfg.Location).Format("2006-01-02 15:04:05")
 			}
 		}
 
