@@ -204,14 +204,16 @@ type SendTaskPayload struct {
 }
 
 type TargetResult struct {
-	TargetID     uuid.UUID  `json:"target_id"`
-	CampaignID   uuid.UUID  `json:"campaign_id"`
-	PhoneNumber  string     `json:"phone_number"`
-	Status       TaskStatus `json:"status"`
-	ReplyText    *string    `json:"reply_text,omitempty"`
-	ErrorMessage *string    `json:"error_message,omitempty"`
-	Timestamp    time.Time  `json:"timestamp"`
-	ChatID       string     `json:"chat_id,omitempty"`
+	TargetID      uuid.UUID  `json:"target_id"`
+	CampaignID    uuid.UUID  `json:"campaign_id"`
+	TenantID      uuid.UUID  `json:"tenant_id,omitempty"`
+	PhoneNumber   string     `json:"phone_number"`
+	Status        TaskStatus `json:"status"`
+	ReplyText     *string    `json:"reply_text,omitempty"`
+	ErrorMessage  *string    `json:"error_message,omitempty"`
+	Timestamp     time.Time  `json:"timestamp"`
+	ChatID        string     `json:"chat_id,omitempty"`
+	MessengerType string     `json:"messenger_type,omitempty"`
 }
 
 // New DTOs for tenant admin notifications
@@ -224,6 +226,9 @@ type ClientReplyInfo struct {
 
 type TenantAdminNotificationTask struct {
 	TenantPhone string            `json:"tenant_phone"`
+	TenantID    string            `json:"tenant_id,omitempty"`
+	ChatID      string            `json:"chat_id,omitempty"`
+	UseChatID   bool              `json:"use_chat_id,omitempty"`
 	Replies     []ClientReplyInfo `json:"replies"`
 }
 
@@ -250,6 +255,8 @@ type CampaignRepository interface {
 	StartCampaign(ctx context.Context, campaignID uuid.UUID) error
 	UpsertChatPhoneMapping(ctx context.Context, mapping *ChatPhoneMapping) error
 	GetChatPhoneMappingByChatID(ctx context.Context, chatID string) (*ChatPhoneMapping, error)
+	GetChatPhoneMappingByPhone(ctx context.Context, tenantID uuid.UUID, phone string, messengerType string) (*ChatPhoneMapping, error)
+	UpsertAdminChatMapping(ctx context.Context, chatID string, tenantID uuid.UUID, phone string, messengerType string) error
 	CountMappedPhones(ctx context.Context, tenantID uuid.UUID, messengerType string, phones []string) (int, error)
 	GetTenantsWithProcessingCampaigns(ctx context.Context) ([]uuid.UUID, error)
 	GetOrCreateTenantDailyQuota(ctx context.Context, tenantID uuid.UUID, quotaDate time.Time, coldMin, coldMax int) (*TenantDailyQuota, error)

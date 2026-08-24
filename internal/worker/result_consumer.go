@@ -243,6 +243,12 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 					log.Printf("ResultConsumer: failed to upsert chat mapping for target %s chat_id=%s: %v", result.TargetID, result.ChatID, err)
 					processedOK = false
 				}
+			} else if result.Status == domain.TaskStatusSent && result.TenantID != uuid.Nil && strings.TrimSpace(result.PhoneNumber) != "" {
+				// Admin notification: TargetID/CampaignID is empty, but we know the tenant_id and phone number.
+				// Save the chat_id so that future notifications will be sent directly to the chat_id.
+				if err := rc.repo.UpsertAdminChatMapping(processCtx, result.ChatID, result.TenantID, result.PhoneNumber, result.MessengerType); err != nil {
+					log.Printf("ResultConsumer: failed to upsert admin chat mapping for chat_id=%s phone=%s: %v", result.ChatID, result.PhoneNumber, err)
+				}
 			}
 
 			if result.TargetID == uuid.Nil || result.CampaignID == uuid.Nil || strings.TrimSpace(result.PhoneNumber) == "" {
@@ -348,9 +354,29 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 			continue
 		}
 
+		// Try to find a saved chat_id for the admin.
+		// If there is one, we send it directly to the chat_id (use_chat_id=true).
+		// If not, we send it to the number (use_chat_id=false). The worker will save the chat_id automatically if successful.
+		adminNormalized := domain.NormalizePhone(tenant.AdminPhone)
+		var adminChatID string
+		var adminUseChatID bool
+		if adminNormalized != "" {
+			mt := string(domain.DefaultMessengerType)
+			if mapping, err := rc.repo.GetChatPhoneMappingByPhone(tenantCtx, tenantID, adminNormalized, mt); err == nil && mapping != nil && mapping.ChatID != "" {
+				adminChatID = mapping.ChatID
+				adminUseChatID = true
+				log.Printf("ResultConsumer: admin chat_id found in mappings: chat_id=%s tenant=%s", adminChatID, tenantID)
+			} else if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				log.Printf("ResultConsumer: admin chat_id lookup failed (fallback to phone) tenant=%s: %v", tenantID, err)
+			}
+		}
+
 		// Prepare the task
 		task := domain.TenantAdminNotificationTask{
+			TenantID:    tenantID.String(),
 			TenantPhone: tenant.AdminPhone,
+			ChatID:      adminChatID,
+			UseChatID:   adminUseChatID,
 			Replies:     replies,
 		}
 
@@ -403,13 +429,13 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				if err != nil {
 					log.Printf("ResultConsumer: still failed to publish notification: %v", err)
 				} else {
-					log.Printf("ResultConsumer: published notification to tenant %s (%d replies)", tenantID, len(replies))
+					log.Printf("ResultConsumer: published notification to tenant %s (%d replies, chat_id=%s, use_chat_id=%v)", tenantID, len(replies), adminChatID, adminUseChatID)
 				}
 			} else {
 				log.Printf("ResultConsumer: failed to reconnect: %v", err)
 			}
 		} else {
-			log.Printf("ResultConsumer: published notification to tenant %s (%d replies)", tenantID, len(replies))
+			log.Printf("ResultConsumer: published notification to tenant %s (%d replies, chat_id=%s, use_chat_id=%v)", tenantID, len(replies), adminChatID, adminUseChatID)
 		}
 	}
 }

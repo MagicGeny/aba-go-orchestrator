@@ -221,7 +221,7 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 			defer wg.Done()
 			for row := range jobs {
 				// Normalize phone: keeping 10 digits starting with 9
-				phone := normalizePhone(row.phone)
+				phone := domain.NormalizePhone(row.phone)
 				if phone == "" {
 					continue
 				}
@@ -346,6 +346,7 @@ func copyFile(src, dst string) error {
 	return err
 }
 
+/*
 func normalizePhone(p string) string {
 	// Simple normalization: find 10 digits starting with 9
 	var digits []rune
@@ -367,6 +368,7 @@ func normalizePhone(p string) string {
 	}
 	return ""
 }
+*/
 
 // GenerateExcel creates or updates an Excel file with current campaign status
 func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UUID) (string, error) {

@@ -617,3 +617,78 @@ func (r *PostgresRepository) GetChatPhoneMappingByChatID(ctx context.Context, ch
 	m.ViewerID = viewerID
 	return &m, nil
 }
+
+// GetChatPhoneMappingByPhone searches for a previously saved chat_id by (tenant_id, phone, messenger_type).
+// Used to send notifications to the admin (and any repeat messages)
+// directly by chat_id, without searching by phone number.
+func (r *PostgresRepository) GetChatPhoneMappingByPhone(ctx context.Context, tenantID uuid.UUID, phone string, messengerType string) (*domain.ChatPhoneMapping, error) {
+	if strings.TrimSpace(phone) == "" {
+		return nil, pgx.ErrNoRows
+	}
+	mt := strings.TrimSpace(messengerType)
+	if mt == "" {
+		mt = "MAX"
+	}
+	var m domain.ChatPhoneMapping
+	var viewerID *int64
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at,
+			tenant_id, COALESCE(messenger_type, 'MAX')
+		FROM chat_phone_mappings
+		WHERE tenant_id = $1
+		  AND phone_normalized = $2
+		  AND messenger_type = $3
+	`, tenantID, phone, mt).Scan(
+		&m.ID, &m.ChatID, &m.CampaignID, &m.CampaignTargetID, &m.PhoneNormalized, &viewerID, &m.CreatedAt, &m.UpdatedAt,
+		&m.TenantID, &m.MessengerType,
+	)
+	if err != nil {
+		return nil, err
+	}
+	m.ViewerID = viewerID
+	return &m, nil
+}
+
+// UpsertAdminChatMapping stores the chat_id for an admin (or any "direct" recipient)
+// that has neither a campaign_id nor a campaign_target_id. It does not perform joins on campaigns/targets,
+// unlike UpsertChatPhoneMapping. It is used for the first and subsequent
+// successful outgoing notifications to the tenant's admin.
+func (r *PostgresRepository) UpsertAdminChatMapping(ctx context.Context, chatID string, tenantID uuid.UUID, phone string, messengerType string) error {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return fmt.Errorf("chat_id is empty")
+	}
+	mt := strings.TrimSpace(messengerType)
+	if mt == "" {
+		mt = "MAX"
+	}
+	id, err := uuid.NewV7()
+	if err != nil {
+		id = uuid.New()
+	}
+	now := time.Now().UTC()
+	_, err = r.pool.Exec(ctx, `
+		INSERT INTO chat_phone_mappings (id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at, tenant_id, messenger_type)
+		VALUES ($1, $2, NULL, NULL, $3, NULL, $4, $4, $5, $6)
+		ON CONFLICT (chat_id) DO UPDATE
+		SET phone_normalized = EXCLUDED.phone_normalized,
+			tenant_id        = EXCLUDED.tenant_id,
+			messenger_type   = EXCLUDED.messenger_type,
+			updated_at       = EXCLUDED.updated_at
+	`, id, chatID, phone, now, tenantID, mt)
+	if err != nil {
+		// Fallback: UPDATE существующей записи по (tenant_id, phone, messenger_type)
+		_, err2 := r.pool.Exec(ctx, `
+			UPDATE chat_phone_mappings m
+			SET chat_id = $1,
+				updated_at = $2
+			WHERE m.tenant_id = $3
+			  AND m.phone_normalized = $4
+			  AND m.messenger_type = $5
+		`, chatID, now, tenantID, phone, mt)
+		if err2 != nil {
+			return fmt.Errorf("upsert admin chat mapping: %w (fallback: %v)", err, err2)
+		}
+	}
+	return nil
+}
