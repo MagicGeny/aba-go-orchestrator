@@ -182,14 +182,18 @@ func main() {
 		mux.ServeHTTP(w, r)
 	})
 
+	listenAddr := os.Getenv("ORCHESTRATOR_LISTEN_ADDR")
+	if listenAddr == "" {
+		listenAddr = ":8080"
+	}
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:    listenAddr,
 		Handler: corsMux,
 	}
 
 	// 6. Start HTTP Server
 	go func() {
-		log.Printf("Starting server on :8080")
+		log.Printf("Starting server on %s", listenAddr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %s\n", err)
 		}
