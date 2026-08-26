@@ -7,10 +7,8 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Build with vendor for reproducible builds
-COPY vendor ./vendor
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -o orchestrator ./cmd/orchestrator
+RUN CGO_ENABLED=0 GOOS=linux go build -o orchestrator ./cmd/orchestrator
 
 # Stage 2: Runner
 FROM alpine:latest
