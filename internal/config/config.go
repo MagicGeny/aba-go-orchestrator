@@ -22,6 +22,7 @@ type Config struct {
 	WorkWindowEndHour      int
 	WorkWindowEndMinute    int
 	Location               *time.Location
+	DisableAutoPolling     bool
 }
 
 func LoadFromEnv() Config {
@@ -35,6 +36,7 @@ func LoadFromEnv() Config {
 		IntervalColdMinMinutes: envInt("INTERVAL_COLD_MIN_MINUTES", 1),
 		IntervalColdMaxMinutes: envInt("INTERVAL_COLD_MAX_MINUTES", 1),
 		Location:               loadLocation(),
+		DisableAutoPolling:     envBool("DISABLE_AUTO_POLLING", true),
 	}
 	parseWorkWindow(&cfg)
 	return cfg
@@ -77,6 +79,18 @@ func envInt(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func envBool(key string, fallback bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return b
 }
 
 func loadLocation() *time.Location {

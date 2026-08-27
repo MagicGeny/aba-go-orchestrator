@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"github.com/google/uuid"
 	"log"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -69,6 +71,20 @@ func (p *ReplyPoller) reconnect() error {
 }
 
 func (p *ReplyPoller) Run(ctx context.Context) {
+	// Check if automatic polling is disabled
+	disableAutoPolling := true // default: disabled (matches config.go default)
+	if v := strings.TrimSpace(os.Getenv("DISABLE_AUTO_POLLING")); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			disableAutoPolling = b
+		}
+	}
+	if disableAutoPolling {
+		log.Println("ReplyPoller: Automatic polling by timer is disabled by config")
+		// Wait for context cancellation so the goroutine doesn't exit prematurely
+		<-ctx.Done()
+		return
+	}
+
 	// Poll every 10 minutes as requested
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
