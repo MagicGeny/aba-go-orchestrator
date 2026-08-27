@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -98,6 +99,7 @@ func main() {
 			httpPublic = endpoint
 		}
 		forceHTTP, _ := strconv.ParseBool(os.Getenv("SEAWEED_FORCE_HTTP_UPLOAD"))
+		publicDownload := strings.TrimRight(os.Getenv("SEAWEED_PUBLIC_DOWNLOAD_URL"), "/")
 
 		store, err := storage.NewS3Store(ctx, storage.S3StoreConfig{
 			Endpoint:          endpoint,
@@ -109,12 +111,21 @@ func main() {
 			SeaweedSubmitURL:  submitURL,
 			ForceHTTPUpload:   forceHTTP,
 			HTTPPublicBaseURL: httpPublic,
+			PublicDownloadURL: publicDownload,
 		})
 		if err != nil {
 			log.Printf("attachment store init failed: %v", err)
 		} else {
-			log.Printf("attachment store: submit=%s public_base=%s s3_endpoint=%s forceHTTP=%v",
-				submitURL, httpPublic, endpoint, forceHTTP)
+			effectiveDownload := publicDownload
+			if effectiveDownload == "" {
+				if forceHTTP {
+					effectiveDownload = httpPublic
+				} else {
+					effectiveDownload = publicBaseURL
+				}
+			}
+			log.Printf("attachment store: submit=%s public_download=%s (configured=%q fallback=%q) s3_endpoint=%s forceHTTP=%v",
+				submitURL, effectiveDownload, publicDownload, httpPublic, endpoint, forceHTTP)
 			attachmentStore = store
 		}
 	}

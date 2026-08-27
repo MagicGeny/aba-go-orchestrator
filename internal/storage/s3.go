@@ -23,6 +23,7 @@ type S3Store struct {
 	client            *s3.Client
 	bucket            string
 	publicBaseURL     string
+	publicDownloadURL string
 	endpoint          string
 	fidUploadURL      string
 	httpClient        *http.Client
@@ -51,6 +52,14 @@ type S3StoreConfig struct {
 	// from SeaweedFS volume /submit responses (e.g. http://localhost:8333).
 	// Defaults to Endpoint.
 	HTTPPublicBaseURL string
+	// PublicDownloadURL is the externally-reachable base URL used to build
+	// the attachment URL returned to the caller (and persisted in DB /
+	// published via RabbitMQ to workers). It MUST be reachable from any
+	// consumer that needs to download the file (e.g. a Python worker
+	// running outside the orchestrator's Docker network). When empty,
+	// S3Store falls back to PublicBaseURL (S3 mode) or HTTPPublicBaseURL
+	// (HTTP mode), preserving the legacy behaviour.
+	PublicDownloadURL string
 }
 
 func NewS3Store(ctx context.Context, cfg S3StoreConfig) (*S3Store, error) {
@@ -107,11 +116,13 @@ func NewS3Store(ctx context.Context, cfg S3StoreConfig) (*S3Store, error) {
 		client:            client,
 		bucket:            cfg.Bucket,
 		publicBaseURL:     strings.TrimRight(publicBaseURL, "/"),
+		publicDownloadURL: strings.TrimRight(cfg.PublicDownloadURL, "/"),
 		endpoint:          endpoint,
 		fidUploadURL:      strings.TrimRight(cfg.SeaweedSubmitURL, "/"),
 		httpClient:        &http.Client{Timeout: 10 * time.Minute},
 		useS3SignedPut:    cfg.UseS3SignedPut,
 		useSeaweedHTTPFid: cfg.ForceHTTPUpload || cfg.SeaweedSubmitURL != "" || cfg.FIDUploadURL != "",
+		httpPublicBaseURL: strings.TrimRight(cfg.HTTPPublicBaseURL, "/"),
 	}, nil
 }
 
@@ -144,7 +155,11 @@ func (s *S3Store) Put(ctx context.Context, key string, body io.Reader, contentTy
 			ContentType: aws.String(contentType),
 		})
 		if s3Err == nil {
-			u, perr := url.Parse(s.publicBaseURL)
+			downloadBase := s.publicDownloadURL
+			if downloadBase == "" {
+				downloadBase = s.publicBaseURL
+			}
+			u, perr := url.Parse(downloadBase)
 			if perr != nil {
 				return "", perr
 			}
@@ -222,7 +237,13 @@ func (s *S3Store) putSeaweedHTTP(ctx context.Context, key string, data []byte, c
 	// default), while the S3 API (8333) is a separate, gated endpoint that
 	// requires auth. We must therefore prefer the FILER host over the S3
 	// endpoint when building downloadable URLs in this mode.
-	publicBase := s.httpPublicBaseURL
+	// The returned URL must be reachable by the consumer (e.g. Python worker),
+	// so we prefer the explicit PublicDownloadURL and only fall back to
+	// internal/public hosts when it is not configured.
+	publicBase := s.publicDownloadURL
+	if publicBase == "" {
+		publicBase = s.httpPublicBaseURL
+	}
 	if publicBase == "" {
 		if s.useSeaweedHTTPFid && !s.useS3SignedPut {
 			publicBase = stripPath(s.fidUploadURL)
