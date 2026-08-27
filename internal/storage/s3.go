@@ -118,7 +118,7 @@ func NewS3Store(ctx context.Context, cfg S3StoreConfig) (*S3Store, error) {
 		publicBaseURL:     strings.TrimRight(publicBaseURL, "/"),
 		publicDownloadURL: strings.TrimRight(cfg.PublicDownloadURL, "/"),
 		endpoint:          endpoint,
-		fidUploadURL:      strings.TrimRight(cfg.SeaweedSubmitURL, "/"),
+		fidUploadURL:      strings.TrimRight(cfg.SeaweedSubmitURL, "/") + "/",
 		httpClient:        &http.Client{Timeout: 10 * time.Minute},
 		useS3SignedPut:    cfg.UseS3SignedPut,
 		useSeaweedHTTPFid: cfg.ForceHTTPUpload || cfg.SeaweedSubmitURL != "" || cfg.FIDUploadURL != "",
