@@ -1,11 +1,14 @@
 package config
 
 import (
+	"log"
 	"math/rand"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	_ "time/tzdata"
 )
 
 type Config struct {
@@ -39,6 +42,9 @@ func LoadFromEnv() Config {
 		DisableAutoPolling:     envBool("DISABLE_AUTO_POLLING", true),
 	}
 	parseWorkWindow(&cfg)
+	log.Printf("config: timezone=%s work_window=%s-%s cold_interval=%d-%d min",
+		cfg.Location.String(), cfg.WorkWindowStart, cfg.WorkWindowEnd,
+		cfg.IntervalColdMinMinutes, cfg.IntervalColdMaxMinutes)
 	return cfg
 }
 
@@ -100,7 +106,8 @@ func loadLocation() *time.Location {
 	}
 	loc, err := time.LoadLocation(tz)
 	if err != nil {
-		return time.UTC
+		log.Printf("config: failed to load timezone %q (%v); using fixed UTC+3 (Moscow)", tz, err)
+		return time.FixedZone("Europe/Moscow", 3*60*60)
 	}
 	return loc
 }

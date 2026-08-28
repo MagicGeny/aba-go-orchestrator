@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"strings"
 	"time"
 
+	"github.com/MagicGeny/aba-go-orchestrator/internal/config"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
 	"github.com/google/uuid"
 	"github.com/rabbitmq/amqp091-go"
@@ -23,6 +25,7 @@ type OutboxWorker struct {
 	warmQueueName string
 	resultsQueue  string
 	blockChecker  BlockChecker
+	cfg           config.Config
 }
 
 const (
@@ -30,7 +33,7 @@ const (
 	QueueSendExistingChat = "tasks.messages.send_existing_chat"
 )
 
-func NewOutboxWorker(repo domain.OutboxRepository, amqpConn *amqp091.Connection, queueName string, warmQueueName string, resultsQueue string, blockChecker BlockChecker) (*OutboxWorker, error) {
+func NewOutboxWorker(repo domain.OutboxRepository, amqpConn *amqp091.Connection, queueName string, warmQueueName string, resultsQueue string, blockChecker BlockChecker, cfg config.Config) (*OutboxWorker, error) {
 	ch, err := amqpConn.Channel()
 	if err != nil {
 		return nil, err
@@ -61,6 +64,7 @@ func NewOutboxWorker(repo domain.OutboxRepository, amqpConn *amqp091.Connection,
 		warmQueueName: warmQueueName,
 		resultsQueue:  resultsQueue,
 		blockChecker:  blockChecker,
+		cfg:           cfg,
 	}, nil
 }
 
@@ -103,6 +107,11 @@ func (w *OutboxWorker) processMessages(ctx context.Context) {
 		}
 		_ = json.Unmarshal(msg.Payload, &sendTask)
 
+		if strings.EqualFold(sendTask.ContactType, "cold") && !w.cfg.IsWithinWorkWindow(time.Now()) {
+			log.Printf("[outbox] deferring cold message id=%s phone=%s until work window %s-%s %s",
+				msg.ID, sendTask.Phone, w.cfg.WorkWindowStart, w.cfg.WorkWindowEnd, w.cfg.Location)
+			continue
+		}
 		if w.blockChecker != nil && sendTask.TenantID != "" && sendTask.Phone != "" {
 			tenantID, errTenant := uuid.Parse(sendTask.TenantID)
 			if errTenant == nil && w.blockChecker.IsBlocked(tenantID, sendTask.Phone) {

@@ -74,6 +74,8 @@ func (d *CampaignDoser) doseTenant(ctx context.Context, tenantID uuid.UUID) erro
 	}
 
 	if !d.cfg.IsWithinWorkWindow(now) {
+		log.Printf("CampaignDoser: tenant %s outside work window %s-%s (%s), skipping cold sends",
+			tenantID, d.cfg.WorkWindowStart, d.cfg.WorkWindowEnd, now.Format("15:04:05 MST"))
 		return nil
 	}
 	if quota.ColdUsed >= quota.ColdLimit {

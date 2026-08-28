@@ -2,6 +2,8 @@ package domain
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -71,6 +73,22 @@ func (s TaskStatus) StatusText() string {
 
 func (s TaskStatus) IsErrorStatus() bool {
 	return s == TaskStatusFailed || s == TaskStatusUserNotFoundByPhone
+}
+
+// Rank is used so viewed/replied cannot be overwritten by an earlier status.
+func (s TaskStatus) Rank() int {
+	switch s {
+	case TaskStatusReplied:
+		return 4
+	case TaskStatusViewed:
+		return 3
+	case TaskStatusSent, TaskStatusDelivered:
+		return 2
+	case TaskStatusPending:
+		return 1
+	default:
+		return 0
+	}
 }
 
 type Tenant struct {
@@ -214,6 +232,52 @@ type TargetResult struct {
 	Timestamp     time.Time  `json:"timestamp"`
 	ChatID        string     `json:"chat_id,omitempty"`
 	MessengerType string     `json:"messenger_type,omitempty"`
+}
+
+func parseOptionalUUID(raw string) (uuid.UUID, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return uuid.Nil, nil
+	}
+	return uuid.Parse(raw)
+}
+
+// UnmarshalJSON accepts omitted/empty UUID fields from the worker
+// (admin notify results send target_id="" which encoding/json rejects).
+func (r *TargetResult) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		TargetID      string     `json:"target_id"`
+		CampaignID    string     `json:"campaign_id"`
+		TenantID      string     `json:"tenant_id"`
+		PhoneNumber   string     `json:"phone_number"`
+		Status        TaskStatus `json:"status"`
+		ReplyText     *string    `json:"reply_text"`
+		ErrorMessage  *string    `json:"error_message"`
+		Timestamp     time.Time  `json:"timestamp"`
+		ChatID        string     `json:"chat_id"`
+		MessengerType string     `json:"messenger_type"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	var err error
+	if r.TargetID, err = parseOptionalUUID(raw.TargetID); err != nil {
+		return err
+	}
+	if r.CampaignID, err = parseOptionalUUID(raw.CampaignID); err != nil {
+		return err
+	}
+	if r.TenantID, err = parseOptionalUUID(raw.TenantID); err != nil {
+		return err
+	}
+	r.PhoneNumber = raw.PhoneNumber
+	r.Status = raw.Status
+	r.ReplyText = raw.ReplyText
+	r.ErrorMessage = raw.ErrorMessage
+	r.Timestamp = raw.Timestamp
+	r.ChatID = raw.ChatID
+	r.MessengerType = raw.MessengerType
+	return nil
 }
 
 // New DTOs for tenant admin notifications

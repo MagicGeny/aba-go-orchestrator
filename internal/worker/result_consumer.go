@@ -265,6 +265,12 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				result.TargetID = mapping.CampaignTargetID
 				result.CampaignID = mapping.CampaignID
 				result.PhoneNumber = mapping.PhoneNormalized
+				if mapping.CampaignTargetID == uuid.Nil {
+					log.Printf("ResultConsumer: chat_id=%s maps to admin/non-campaign row (skipping status=%s)", result.ChatID, result.Status)
+					cancel()
+					_ = item.msg.Ack(false)
+					continue
+				}
 			}
 		}
 

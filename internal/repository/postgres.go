@@ -252,8 +252,12 @@ func (r *PostgresRepository) UpdateTargetStatus(ctx context.Context, targetID uu
 	if err != nil {
 		return nil, err
 	}
+	statusToWrite := status
+	if !status.IsErrorStatus() && oldStatus.Rank() > status.Rank() {
+		statusToWrite = oldStatus
+	}
 	_, err = tx.Exec(ctx, "UPDATE campaign_targets SET status = $1, last_error = $2, sent_at = COALESCE($3, sent_at), updated_at = $4 WHERE id = $5",
-		status, lastError, finalSentAt, now, targetID)
+		statusToWrite, lastError, finalSentAt, now, targetID)
 	if err != nil {
 		return nil, err
 	}
@@ -602,17 +606,25 @@ func (r *PostgresRepository) UpsertChatPhoneMapping(ctx context.Context, mapping
 func (r *PostgresRepository) GetChatPhoneMappingByChatID(ctx context.Context, chatID string) (*domain.ChatPhoneMapping, error) {
 	var m domain.ChatPhoneMapping
 	var viewerID *int64
+	var campaignID *uuid.UUID
+	var targetID *uuid.UUID
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at,
 			tenant_id, COALESCE(messenger_type, 'MAX')
 		FROM chat_phone_mappings
 		WHERE chat_id = $1
 	`, chatID).Scan(
-		&m.ID, &m.ChatID, &m.CampaignID, &m.CampaignTargetID, &m.PhoneNormalized, &viewerID, &m.CreatedAt, &m.UpdatedAt,
+		&m.ID, &m.ChatID, &campaignID, &targetID, &m.PhoneNormalized, &viewerID, &m.CreatedAt, &m.UpdatedAt,
 		&m.TenantID, &m.MessengerType,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if campaignID != nil {
+		m.CampaignID = *campaignID
+	}
+	if targetID != nil {
+		m.CampaignTargetID = *targetID
 	}
 	m.ViewerID = viewerID
 	return &m, nil
@@ -631,6 +643,8 @@ func (r *PostgresRepository) GetChatPhoneMappingByPhone(ctx context.Context, ten
 	}
 	var m domain.ChatPhoneMapping
 	var viewerID *int64
+	var campaignID *uuid.UUID
+	var targetID *uuid.UUID
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at,
 			tenant_id, COALESCE(messenger_type, 'MAX')
@@ -639,11 +653,17 @@ func (r *PostgresRepository) GetChatPhoneMappingByPhone(ctx context.Context, ten
 		  AND phone_normalized = $2
 		  AND messenger_type = $3
 	`, tenantID, phone, mt).Scan(
-		&m.ID, &m.ChatID, &m.CampaignID, &m.CampaignTargetID, &m.PhoneNormalized, &viewerID, &m.CreatedAt, &m.UpdatedAt,
+		&m.ID, &m.ChatID, &campaignID, &targetID, &m.PhoneNormalized, &viewerID, &m.CreatedAt, &m.UpdatedAt,
 		&m.TenantID, &m.MessengerType,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if campaignID != nil {
+		m.CampaignID = *campaignID
+	}
+	if targetID != nil {
+		m.CampaignTargetID = *targetID
 	}
 	m.ViewerID = viewerID
 	return &m, nil
@@ -661,6 +681,10 @@ func (r *PostgresRepository) UpsertAdminChatMapping(ctx context.Context, chatID 
 	mt := strings.TrimSpace(messengerType)
 	if mt == "" {
 		mt = "MAX"
+	}
+	phone = domain.NormalizePhone(phone)
+	if phone == "" {
+		return fmt.Errorf("admin phone is empty after normalize")
 	}
 	id, err := uuid.NewV7()
 	if err != nil {

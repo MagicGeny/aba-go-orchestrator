@@ -131,6 +131,7 @@ func main() {
 	}
 
 	cfg := config.LoadFromEnv()
+	warnMissingTenantBaseline(ctx, pool)
 	campaignUC := usecase.NewCampaignUseCase(repo, attachmentStore, cfg)
 	hub := transport.NewHub()
 
@@ -138,7 +139,7 @@ func main() {
 	blocklistCache := blocklist.NewCache(repo, 10*time.Minute)
 	go blocklistCache.Run(ctx)
 
-	outboxWorker, err := worker.NewOutboxWorker(repo, amqpConn, worker.QueueSend, worker.QueueSendExistingChat, "tasks.messages.results_replies_queue", blocklistCache)
+	outboxWorker, err := worker.NewOutboxWorker(repo, amqpConn, worker.QueueSend, worker.QueueSendExistingChat, "tasks.messages.results_replies_queue", blocklistCache, cfg)
 	if err != nil {
 		log.Fatalf("failed to init outbox worker: %v", err)
 	}
@@ -222,6 +223,30 @@ func main() {
 	}
 
 	log.Println("Server exiting")
+}
+
+func warnMissingTenantBaseline(ctx context.Context, pool *pgxpool.Pool) {
+	rows, err := pool.Query(ctx, `SELECT id, COALESCE(name, ''), COALESCE(admin_phone, '') FROM tenants`)
+	if err != nil {
+		log.Printf("startup: could not check tenants baseline: %v", err)
+		return
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var id, name, adminPhone string
+		if err := rows.Scan(&id, &name, &adminPhone); err != nil {
+			log.Printf("startup: tenant baseline scan failed: %v", err)
+			return
+		}
+		count++
+		if strings.TrimSpace(adminPhone) == "" {
+			log.Printf("startup: tenant %s (%s) has empty admin_phone — reply notifications will be skipped", id, name)
+		}
+	}
+	if count == 0 {
+		log.Printf("startup: tenants table is empty — campaigns and admin notifications cannot run")
+	}
 }
 
 func runMigrations(dbURL string) {
