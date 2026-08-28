@@ -97,15 +97,20 @@ func (r *PostgresRepository) GetNextPendingColdTarget(ctx context.Context, tenan
 }
 
 func (r *PostgresRepository) getNextPendingTarget(ctx context.Context, tenantID uuid.UUID, warm bool) (*domain.PendingTargetForDosing, error) {
-	mappingClause := `
-		AND EXISTS (
-			SELECT 1 FROM chat_phone_mappings m
-			WHERE m.tenant_id = c.tenant_id
-			  AND m.phone_normalized = ct.phone_normalized
-			  AND m.messenger_type = COALESCE(ct.messenger_type, 'MAX')
-			  AND m.chat_id IS NOT NULL AND m.chat_id <> ''
-		)`
+	// If warm=true, we return any pending target regardless of whether it has
+	// a chat_phone_mapping. The LEFT JOIN LATERAL below populates ChatID when
+	// a mapping exists; scheduleTarget then sets use_chat_id based on that.
+	// This prevents the pipeline from stalling when targets have no mapping
+	// (e.g. because the recipient doesn't exist in MAX or it's a new number).
+	//
+	// If warm=false, we still return any pending target too — the caller
+	// (doseTenant) applies cold-specific gates (work window, cold limit,
+	// cold interval) before calling this path.
+	mappingClause := ""
 	if !warm {
+		// Cold path: only targets that have NO chat_phone_mapping at all.
+		// These are genuinely new contacts that should be subject to the
+		// cold anti‑ban gates (work window, cold limit, cold interval).
 		mappingClause = `
 		AND NOT EXISTS (
 			SELECT 1 FROM chat_phone_mappings m
