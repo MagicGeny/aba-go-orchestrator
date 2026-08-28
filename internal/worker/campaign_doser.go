@@ -3,6 +3,8 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 	"log"
 	"math/rand"
 	"strings"
@@ -94,8 +96,12 @@ func (d *CampaignDoser) doseTenant(ctx context.Context, tenantID uuid.UUID) erro
 	return d.scheduleTarget(ctx, target, quotaDate, now, true)
 }
 
+func CapitalizeText(s string) string {
+	return cases.Title(language.Russian).String(strings.ToLower(strings.TrimSpace(s)))
+}
+
 func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.PendingTargetForDosing, quotaDate, now time.Time, isCold bool) error {
-	messageText := strings.ReplaceAll(target.MessageTemplate, "{user_name}", target.ClientName)
+	messageText := strings.ReplaceAll(target.MessageTemplate, "{user_name}", CapitalizeText(target.ClientName))
 	contactType := "warm"
 	useChatID := target.IsWarm && target.ChatID != ""
 	if isCold {
