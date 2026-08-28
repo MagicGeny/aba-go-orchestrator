@@ -478,7 +478,7 @@ func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UU
 				if messenger == "" {
 					messenger = domain.DefaultMessengerType
 				}
-				statusText = fmt.Sprintf("User not found in %s", messenger)
+				statusText = fmt.Sprintf("Пользователь на найден в %s", messenger)
 			} else if target.LastError != nil && target.Status == domain.TaskStatusFailed {
 				statusText = fmt.Sprintf("%s: %s", statusText, *target.LastError)
 			}

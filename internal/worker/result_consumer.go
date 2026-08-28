@@ -241,7 +241,6 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				})
 				if err != nil {
 					log.Printf("ResultConsumer: failed to upsert chat mapping for target %s chat_id=%s: %v", result.TargetID, result.ChatID, err)
-					processedOK = false
 				}
 			} else if result.Status == domain.TaskStatusSent && result.TenantID != uuid.Nil && strings.TrimSpace(result.PhoneNumber) != "" {
 				// Admin notification: TargetID/CampaignID is empty, but we know the tenant_id and phone number.
@@ -269,8 +268,45 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 			}
 		}
 
+		if result.Status == domain.TaskStatusSent && result.TenantID != uuid.Nil && result.TargetID == uuid.Nil && result.CampaignID == uuid.Nil {
+			cancel()
+			if err := item.msg.Ack(false); err != nil {
+				log.Printf("ResultConsumer: failed to ack message: %v", err)
+			}
+			continue
+		}
+
+		if result.TargetID == uuid.Nil || result.CampaignID == uuid.Nil {
+			if result.ChatID != "" {
+				log.Printf("ResultConsumer: unresolved mapping (skipping): chat_id=%s status=%s", result.ChatID, result.Status)
+			} else {
+				log.Printf("ResultConsumer: unresolved mapping (skipping): target=%s campaign=%s status=%s", result.TargetID, result.CampaignID, result.Status)
+			}
+			cancel()
+			_ = item.msg.Ack(false)
+			continue
+		}
+
 		if result.ReplyText != nil && result.Status == domain.TaskStatusReplied {
-			// First, register the reply in DB
+			if existingTarget, err := rc.repo.GetCampaignTargetByID(processCtx, result.TargetID); err == nil && existingTarget != nil {
+				if existingTarget.Status == domain.TaskStatusReplied && existingTarget.LastReplyText != nil && existingTarget.RepliedAt != nil {
+					if strings.TrimSpace(*existingTarget.LastReplyText) == strings.TrimSpace(*result.ReplyText) {
+						d := existingTarget.RepliedAt.Sub(result.Timestamp)
+						if d < 0 {
+							d = -d
+						}
+						if d <= 2*time.Minute {
+							log.Printf("ResultConsumer: duplicate reply detected (skipping): target=%s chat_id=%s", result.TargetID, result.ChatID)
+							cancel()
+							if err := item.msg.Ack(false); err != nil {
+								log.Printf("ResultConsumer: failed to ack message: %v", err)
+							}
+							continue
+						}
+					}
+				}
+			}
+
 			campaign, err := rc.repo.RegisterReply(processCtx, result.CampaignID, result.PhoneNumber, *result.ReplyText, result.Timestamp)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to register reply for target %s: %v", result.TargetID, err)
@@ -279,7 +315,6 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				goto finish
 			}
 
-			// Now, get the CampaignTarget to retrieve ClientName
 			target, err := rc.repo.GetCampaignTargetByID(processCtx, result.TargetID)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to get target %s: %v", result.TargetID, err)
