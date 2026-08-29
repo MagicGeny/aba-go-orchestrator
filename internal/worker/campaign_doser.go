@@ -6,7 +6,7 @@ import (
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -26,7 +26,8 @@ func NewCampaignDoser(repo domain.CampaignRepository, cfg config.Config) *Campai
 }
 
 func (d *CampaignDoser) Run(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+	randTime := 10 + rand.IntN(20-10+1)
+	ticker := time.NewTicker(time.Duration(randTime) * time.Second)
 	defer ticker.Stop()
 	log.Println("CampaignDoser: started")
 
@@ -69,7 +70,7 @@ func (d *CampaignDoser) doseTenant(ctx context.Context, tenantID uuid.UUID) erro
 			return err
 		}
 		if target != nil {
-			return d.scheduleTarget(ctx, target, quotaDate, now, false)
+			return d.scheduleTarget(ctx, target, quotaDate, now, false, 0)
 		}
 	}
 
@@ -81,11 +82,9 @@ func (d *CampaignDoser) doseTenant(ctx context.Context, tenantID uuid.UUID) erro
 	if quota.ColdUsed >= quota.ColdLimit {
 		return nil
 	}
-	if quota.LastColdPublishAt != nil {
-		interval := randomColdInterval(d.cfg)
-		if now.Sub(*quota.LastColdPublishAt) < interval {
-			return nil
-		}
+	interval := d.cfg.RandomColdInterval()
+	if quota.LastColdPublishAt != nil && now.Sub(*quota.LastColdPublishAt) < interval {
+		return nil
 	}
 
 	target, err := d.repo.GetNextPendingColdTarget(ctx, tenantID)
@@ -95,14 +94,14 @@ func (d *CampaignDoser) doseTenant(ctx context.Context, tenantID uuid.UUID) erro
 	if target == nil {
 		return nil
 	}
-	return d.scheduleTarget(ctx, target, quotaDate, now, true)
+	return d.scheduleTarget(ctx, target, quotaDate, now, true, interval)
 }
 
 func CapitalizeText(s string) string {
 	return cases.Title(language.Russian).String(strings.ToLower(strings.TrimSpace(s)))
 }
 
-func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.PendingTargetForDosing, quotaDate, now time.Time, isCold bool) error {
+func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.PendingTargetForDosing, quotaDate, now time.Time, isCold bool, coldInterval time.Duration) error {
 	messageText := strings.ReplaceAll(target.MessageTemplate, "{user_name}", CapitalizeText(target.ClientName))
 	contactType := "warm"
 	useChatID := target.IsWarm && target.ChatID != ""
@@ -139,28 +138,20 @@ func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.Pendi
 		return err
 	}
 
-	if err := d.repo.CreateDosedOutboxMessage(ctx, target.TenantID, eventType, payload, now.UTC()); err != nil {
-		return err
-	}
-
+	at := now.UTC()
 	if isCold {
-		if err := d.repo.IncrementColdUsed(ctx, target.TenantID, quotaDate); err != nil {
+		reserved, err := d.repo.TryReserveColdSlot(ctx, target.TenantID, quotaDate, at, coldInterval)
+		if err != nil {
 			return err
 		}
-		return d.repo.UpdateLastColdPublishAt(ctx, target.TenantID, quotaDate, now.UTC())
+		if !reserved {
+			return nil
+		}
+		return d.repo.CreateDosedOutboxMessage(ctx, target.TenantID, eventType, payload, at)
+	}
+
+	if err := d.repo.CreateDosedOutboxMessage(ctx, target.TenantID, eventType, payload, at); err != nil {
+		return err
 	}
 	return d.repo.IncrementWarmUsed(ctx, target.TenantID, quotaDate)
-}
-
-func randomColdInterval(cfg config.Config) time.Duration {
-	min := cfg.IntervalColdMinMinutes
-	max := cfg.IntervalColdMaxMinutes
-	if max < min {
-		max = min
-	}
-	minutes := min
-	if max > min {
-		minutes = min + rand.Intn(max-min+1)
-	}
-	return time.Duration(minutes) * time.Minute
 }

@@ -327,9 +327,10 @@ type CampaignRepository interface {
 	GetNextPendingWarmTarget(ctx context.Context, tenantID uuid.UUID) (*PendingTargetForDosing, error)
 	GetNextPendingColdTarget(ctx context.Context, tenantID uuid.UUID) (*PendingTargetForDosing, error)
 	CreateDosedOutboxMessage(ctx context.Context, tenantID uuid.UUID, eventType string, payload []byte, publishAt time.Time) error
-	IncrementColdUsed(ctx context.Context, tenantID uuid.UUID, quotaDate time.Time) error
+	// TryReserveColdSlot atomically takes a cold send slot if the daily limit
+	// and minInterval have been satisfied. Returns false when the tenant must wait.
+	TryReserveColdSlot(ctx context.Context, tenantID uuid.UUID, quotaDate time.Time, at time.Time, minInterval time.Duration) (bool, error)
 	IncrementWarmUsed(ctx context.Context, tenantID uuid.UUID, quotaDate time.Time) error
-	UpdateLastColdPublishAt(ctx context.Context, tenantID uuid.UUID, quotaDate time.Time, at time.Time) error
 }
 
 type OutboxRepository interface {

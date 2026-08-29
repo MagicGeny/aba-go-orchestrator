@@ -184,13 +184,28 @@ func (r *PostgresRepository) CreateDosedOutboxMessage(ctx context.Context, tenan
 	return err
 }
 
-func (r *PostgresRepository) IncrementColdUsed(ctx context.Context, tenantID uuid.UUID, quotaDate time.Time) error {
-	_, err := r.pool.Exec(ctx, `
+func (r *PostgresRepository) TryReserveColdSlot(ctx context.Context, tenantID uuid.UUID, quotaDate time.Time, at time.Time, minInterval time.Duration) (bool, error) {
+	secs := int64(minInterval / time.Second)
+	if secs < 0 {
+		secs = 0
+	}
+	tag, err := r.pool.Exec(ctx, `
 		UPDATE tenant_daily_quotas
-		SET cold_used = cold_used + 1, updated_at = NOW()
-		WHERE tenant_id = $1 AND quota_date = $2::date`,
-		tenantID, quotaDateParam(quotaDate))
-	return err
+		SET cold_used = cold_used + 1,
+		    last_cold_publish_at = $3,
+		    updated_at = NOW()
+		WHERE tenant_id = $1
+		  AND quota_date = $2::date
+		  AND cold_used < cold_limit
+		  AND (
+		    last_cold_publish_at IS NULL
+		    OR last_cold_publish_at + make_interval(secs => $4::int) <= $3
+		  )`,
+		tenantID, quotaDateParam(quotaDate), at, secs)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 func (r *PostgresRepository) IncrementWarmUsed(ctx context.Context, tenantID uuid.UUID, quotaDate time.Time) error {
@@ -199,14 +214,5 @@ func (r *PostgresRepository) IncrementWarmUsed(ctx context.Context, tenantID uui
 		SET warm_used = warm_used + 1, updated_at = NOW()
 		WHERE tenant_id = $1 AND quota_date = $2::date`,
 		tenantID, quotaDateParam(quotaDate))
-	return err
-}
-
-func (r *PostgresRepository) UpdateLastColdPublishAt(ctx context.Context, tenantID uuid.UUID, quotaDate time.Time, at time.Time) error {
-	_, err := r.pool.Exec(ctx, `
-		UPDATE tenant_daily_quotas
-		SET last_cold_publish_at = $3, updated_at = NOW()
-		WHERE tenant_id = $1 AND quota_date = $2::date`,
-		tenantID, quotaDateParam(quotaDate), at)
 	return err
 }
