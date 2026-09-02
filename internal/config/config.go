@@ -37,7 +37,7 @@ func LoadFromEnv() Config {
 		WorkWindowStart:        envString("WORK_WINDOW_START", "07:00"),
 		WorkWindowEnd:          envString("WORK_WINDOW_END", "21:00"),
 		IntervalColdMinMinutes: envInt("INTERVAL_COLD_MIN_MINUTES", 1),
-		IntervalColdMaxMinutes: envInt("INTERVAL_COLD_MAX_MINUTES", 2),
+		IntervalColdMaxMinutes: envInt("INTERVAL_COLD_MAX_MINUTES", 5),
 		Location:               loadLocation(),
 		DisableAutoPolling:     envBool("DISABLE_AUTO_POLLING", true),
 	}
