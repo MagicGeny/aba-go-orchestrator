@@ -4,16 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
-	"strings"
-	"sync"
-	"time"
-
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/usecase"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/rabbitmq/amqp091-go"
+	"log"
+	"math/rand/v2"
+	"strings"
+	"sync"
+	"time"
 )
 
 const (
@@ -435,6 +435,16 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 			if err != nil {
 				log.Printf("ResultConsumer: failed to serialize notification task for tenant %s phone %s: %v", tenantID, adminPhone, err)
 				continue
+			}
+
+			delaySec := 45 + rand.IntN(31)
+			log.Printf("ResultConsumer: sleeping for %d seconds before notifying admin (%s)", delaySec, adminPhone)
+
+			select {
+			case <-ctx.Done():
+				log.Printf("ResultConsumer: context canceled during admin notify delay for tenant %s", tenantID)
+				return
+			case <-time.After(time.Duration(delaySec) * time.Second):
 			}
 
 			// Publish to RabbitMQ

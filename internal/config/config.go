@@ -20,6 +20,8 @@ type Config struct {
 	WorkWindowEnd          string
 	IntervalColdMinMinutes int
 	IntervalColdMaxMinutes int
+	IntervalWarmMinMinutes int
+	IntervalWarmMaxMinutes int
 	WorkWindowStartHour    int
 	WorkWindowStartMinute  int
 	WorkWindowEndHour      int
@@ -38,13 +40,16 @@ func LoadFromEnv() Config {
 		WorkWindowEnd:          envString("WORK_WINDOW_END", "20:45"),
 		IntervalColdMinMinutes: envInt("INTERVAL_COLD_MIN_MINUTES", 1),
 		IntervalColdMaxMinutes: envInt("INTERVAL_COLD_MAX_MINUTES", 5),
+		IntervalWarmMinMinutes: envInt("INTERVAL_WARM_MIN_MINUTES", 1),
+		IntervalWarmMaxMinutes: envInt("INTERVAL_WARM_MAX_MINUTES", 1),
 		Location:               loadLocation(),
 		DisableAutoPolling:     envBool("DISABLE_AUTO_POLLING", true),
 	}
 	parseWorkWindow(&cfg)
-	log.Printf("config: timezone=%s work_window=%s-%s cold_interval=%d-%d min",
+	log.Printf("config: timezone=%s work_window=%s-%s cold_interval=%d-%d min warm_interval=%d-%d min",
 		cfg.Location.String(), cfg.WorkWindowStart, cfg.WorkWindowEnd,
-		cfg.IntervalColdMinMinutes, cfg.IntervalColdMaxMinutes)
+		cfg.IntervalColdMinMinutes, cfg.IntervalColdMaxMinutes,
+		cfg.IntervalWarmMinMinutes, cfg.IntervalWarmMaxMinutes)
 	return cfg
 }
 
@@ -58,6 +63,19 @@ func (c Config) IsWithinWorkWindow(now time.Time) bool {
 func (c Config) RandomColdInterval() time.Duration {
 	min := c.IntervalColdMinMinutes
 	max := c.IntervalColdMaxMinutes
+	if max < min {
+		max = min
+	}
+	minutes := min
+	if max > min {
+		minutes = min + rand.Intn(max-min+1)
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+func (c Config) RandomWarmInterval() time.Duration {
+	min := c.IntervalWarmMinMinutes
+	max := c.IntervalWarmMaxMinutes
 	if max < min {
 		max = min
 	}

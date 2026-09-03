@@ -3,12 +3,13 @@ package worker
 import (
 	"context"
 	"encoding/json"
-	"golang.org/x/text/cases"
-	"golang.org/x/text/language"
 	"log"
 	"math/rand/v2"
 	"strings"
 	"time"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/config"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
@@ -101,7 +102,7 @@ func CapitalizeText(s string) string {
 	return cases.Title(language.Russian).String(strings.ToLower(strings.TrimSpace(s)))
 }
 
-func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.PendingTargetForDosing, quotaDate, now time.Time, isCold bool, coldInterval time.Duration) error {
+func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.PendingTargetForDosing, quotaDate, now time.Time, isCold bool, interval time.Duration) error {
 	messageText := strings.ReplaceAll(target.MessageTemplate, "{user_name}", CapitalizeText(target.ClientName))
 	contactType := "warm"
 	useChatID := target.IsWarm && target.ChatID != ""
@@ -140,7 +141,7 @@ func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.Pendi
 
 	at := now.UTC()
 	if isCold {
-		reserved, err := d.repo.TryReserveColdSlot(ctx, target.TenantID, quotaDate, at, coldInterval)
+		reserved, err := d.repo.TryReserveColdSlot(ctx, target.TenantID, quotaDate, at, interval)
 		if err != nil {
 			return err
 		}
@@ -150,7 +151,9 @@ func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.Pendi
 		return d.repo.CreateDosedOutboxMessage(ctx, target.TenantID, eventType, payload, at)
 	}
 
-	if err := d.repo.CreateDosedOutboxMessage(ctx, target.TenantID, eventType, payload, at); err != nil {
+	// For warm messages, apply the interval delay
+	warmPublishAt := at.Add(interval)
+	if err := d.repo.CreateDosedOutboxMessage(ctx, target.TenantID, eventType, payload, warmPublishAt); err != nil {
 		return err
 	}
 	return d.repo.IncrementWarmUsed(ctx, target.TenantID, quotaDate)
