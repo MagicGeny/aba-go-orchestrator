@@ -32,11 +32,11 @@ type Config struct {
 
 func LoadFromEnv() Config {
 	cfg := Config{
-		LimitColdMin:           envInt("LIMIT_COLD_MIN", 100),
-		LimitColdMax:           envInt("LIMIT_COLD_MAX", 300),
+		LimitColdMin:           envInt("LIMIT_COLD_MIN", 141),
+		LimitColdMax:           envInt("LIMIT_COLD_MAX", 159),
 		LimitColdEstimatedAvg:  envInt("LIMIT_COLD_ESTIMATED_AVG", 150),
 		LimitWarmDaily:         envInt("LIMIT_WARM_DAILY", 500),
-		WorkWindowStart:        envString("WORK_WINDOW_START", "08:30"),
+		WorkWindowStart:        envString("WORK_WINDOW_START", "09:15"),
 		WorkWindowEnd:          envString("WORK_WINDOW_END", "20:45"),
 		IntervalColdMinMinutes: envInt("INTERVAL_COLD_MIN_MINUTES", 1),
 		IntervalColdMaxMinutes: envInt("INTERVAL_COLD_MAX_MINUTES", 5),
