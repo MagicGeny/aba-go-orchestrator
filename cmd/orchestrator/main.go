@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/rabbitmq/amqp091-go"
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/blocklist"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/config"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/repository"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/storage"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/transport"
@@ -97,6 +99,7 @@ func main() {
 			httpPublic = endpoint
 		}
 		forceHTTP, _ := strconv.ParseBool(os.Getenv("SEAWEED_FORCE_HTTP_UPLOAD"))
+		publicDownload := strings.TrimRight(os.Getenv("SEAWEED_PUBLIC_DOWNLOAD_URL"), "/")
 
 		store, err := storage.NewS3Store(ctx, storage.S3StoreConfig{
 			Endpoint:          endpoint,
@@ -108,28 +111,42 @@ func main() {
 			SeaweedSubmitURL:  submitURL,
 			ForceHTTPUpload:   forceHTTP,
 			HTTPPublicBaseURL: httpPublic,
+			PublicDownloadURL: publicDownload,
 		})
 		if err != nil {
 			log.Printf("attachment store init failed: %v", err)
 		} else {
-			log.Printf("attachment store: submit=%s public_base=%s s3_endpoint=%s forceHTTP=%v",
-				submitURL, httpPublic, endpoint, forceHTTP)
+			effectiveDownload := publicDownload
+			if effectiveDownload == "" {
+				if forceHTTP {
+					effectiveDownload = httpPublic
+				} else {
+					effectiveDownload = publicBaseURL
+				}
+			}
+			log.Printf("attachment store: submit=%s public_download=%s (configured=%q fallback=%q) s3_endpoint=%s forceHTTP=%v",
+				submitURL, effectiveDownload, publicDownload, httpPublic, endpoint, forceHTTP)
 			attachmentStore = store
 		}
 	}
 
-	campaignUC := usecase.NewCampaignUseCase(repo, attachmentStore)
+	cfg := config.LoadFromEnv()
+	warnMissingTenantBaseline(ctx, pool)
+	campaignUC := usecase.NewCampaignUseCase(repo, attachmentStore, cfg)
 	hub := transport.NewHub()
 
 	// 4. Start Workers
 	blocklistCache := blocklist.NewCache(repo, 10*time.Minute)
 	go blocklistCache.Run(ctx)
 
-	outboxWorker, err := worker.NewOutboxWorker(repo, amqpConn, "tasks.messages.send", "tasks.messages.results_replies_queue", blocklistCache)
+	outboxWorker, err := worker.NewOutboxWorker(repo, amqpConn, worker.QueueSend, worker.QueueSendExistingChat, "tasks.messages.results_replies_queue", blocklistCache, cfg)
 	if err != nil {
 		log.Fatalf("failed to init outbox worker: %v", err)
 	}
 	go outboxWorker.Run(ctx)
+
+	campaignDoser := worker.NewCampaignDoser(repo, cfg)
+	go campaignDoser.Run(ctx)
 
 	schedulerWorker := worker.NewSchedulerWorker(repo)
 	go schedulerWorker.Run(ctx)
@@ -177,14 +194,18 @@ func main() {
 		mux.ServeHTTP(w, r)
 	})
 
+	listenAddr := os.Getenv("ORCHESTRATOR_LISTEN_ADDR")
+	if listenAddr == "" {
+		listenAddr = ":8080"
+	}
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:    listenAddr,
 		Handler: corsMux,
 	}
 
 	// 6. Start HTTP Server
 	go func() {
-		log.Printf("Starting server on :8080")
+		log.Printf("Starting server on %s", listenAddr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %s\n", err)
 		}
@@ -202,6 +223,30 @@ func main() {
 	}
 
 	log.Println("Server exiting")
+}
+
+func warnMissingTenantBaseline(ctx context.Context, pool *pgxpool.Pool) {
+	rows, err := pool.Query(ctx, `SELECT id, COALESCE(name, ''), COALESCE(admin_phone, '') FROM tenants`)
+	if err != nil {
+		log.Printf("startup: could not check tenants baseline: %v", err)
+		return
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var id, name, adminPhone string
+		if err := rows.Scan(&id, &name, &adminPhone); err != nil {
+			log.Printf("startup: tenant baseline scan failed: %v", err)
+			return
+		}
+		count++
+		if strings.TrimSpace(adminPhone) == "" {
+			log.Printf("startup: tenant %s (%s) has empty admin_phone — reply notifications will be skipped", id, name)
+		}
+	}
+	if count == 0 {
+		log.Printf("startup: tenants table is empty — campaigns and admin notifications cannot run")
+	}
 }
 
 func runMigrations(dbURL string) {

@@ -1,0 +1,2 @@
+ALTER TABLE tenants 
+    ALTER COLUMN admin_phone TYPE VARCHAR(100);

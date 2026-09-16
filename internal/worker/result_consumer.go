@@ -4,16 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
-	"strings"
-	"sync"
-	"time"
-
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/usecase"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/rabbitmq/amqp091-go"
+	"log"
+	"math/rand/v2"
+	"strings"
+	"sync"
+	"time"
 )
 
 const (
@@ -241,7 +241,12 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				})
 				if err != nil {
 					log.Printf("ResultConsumer: failed to upsert chat mapping for target %s chat_id=%s: %v", result.TargetID, result.ChatID, err)
-					processedOK = false
+				}
+			} else if result.Status == domain.TaskStatusSent && result.TenantID != uuid.Nil && strings.TrimSpace(result.PhoneNumber) != "" {
+				// Admin notification: TargetID/CampaignID is empty, but we know the tenant_id and phone number.
+				// Save the chat_id so that future notifications will be sent directly to the chat_id.
+				if err := rc.repo.UpsertAdminChatMapping(processCtx, result.ChatID, result.TenantID, result.PhoneNumber, result.MessengerType); err != nil {
+					log.Printf("ResultConsumer: failed to upsert admin chat mapping for chat_id=%s phone=%s: %v", result.ChatID, result.PhoneNumber, err)
 				}
 			}
 
@@ -260,11 +265,54 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				result.TargetID = mapping.CampaignTargetID
 				result.CampaignID = mapping.CampaignID
 				result.PhoneNumber = mapping.PhoneNormalized
+				if mapping.CampaignTargetID == uuid.Nil {
+					log.Printf("ResultConsumer: chat_id=%s maps to admin/non-campaign row (skipping status=%s)", result.ChatID, result.Status)
+					cancel()
+					_ = item.msg.Ack(false)
+					continue
+				}
 			}
 		}
 
+		if result.Status == domain.TaskStatusSent && result.TenantID != uuid.Nil && result.TargetID == uuid.Nil && result.CampaignID == uuid.Nil {
+			cancel()
+			if err := item.msg.Ack(false); err != nil {
+				log.Printf("ResultConsumer: failed to ack message: %v", err)
+			}
+			continue
+		}
+
+		if result.TargetID == uuid.Nil || result.CampaignID == uuid.Nil {
+			if result.ChatID != "" {
+				log.Printf("ResultConsumer: unresolved mapping (skipping): chat_id=%s status=%s", result.ChatID, result.Status)
+			} else {
+				log.Printf("ResultConsumer: unresolved mapping (skipping): target=%s campaign=%s status=%s", result.TargetID, result.CampaignID, result.Status)
+			}
+			cancel()
+			_ = item.msg.Ack(false)
+			continue
+		}
+
 		if result.ReplyText != nil && result.Status == domain.TaskStatusReplied {
-			// First, register the reply in DB
+			if existingTarget, err := rc.repo.GetCampaignTargetByID(processCtx, result.TargetID); err == nil && existingTarget != nil {
+				if existingTarget.Status == domain.TaskStatusReplied && existingTarget.LastReplyText != nil && existingTarget.RepliedAt != nil {
+					if strings.TrimSpace(*existingTarget.LastReplyText) == strings.TrimSpace(*result.ReplyText) {
+						d := existingTarget.RepliedAt.Sub(result.Timestamp)
+						if d < 0 {
+							d = -d
+						}
+						if d <= 2*time.Minute {
+							log.Printf("ResultConsumer: duplicate reply detected (skipping): target=%s chat_id=%s", result.TargetID, result.ChatID)
+							cancel()
+							if err := item.msg.Ack(false); err != nil {
+								log.Printf("ResultConsumer: failed to ack message: %v", err)
+							}
+							continue
+						}
+					}
+				}
+			}
+
 			campaign, err := rc.repo.RegisterReply(processCtx, result.CampaignID, result.PhoneNumber, *result.ReplyText, result.Timestamp)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to register reply for target %s: %v", result.TargetID, err)
@@ -273,7 +321,6 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				goto finish
 			}
 
-			// Now, get the CampaignTarget to retrieve ClientName
 			target, err := rc.repo.GetCampaignTargetByID(processCtx, result.TargetID)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to get target %s: %v", result.TargetID, err)
@@ -296,6 +343,13 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 		} else if result.Status == domain.TaskStatusViewed {
 			// Handle "viewed" status - update target status and record viewed time
 			_, err := rc.repo.UpdateTargetStatus(processCtx, result.TargetID, domain.TaskStatus(result.Status), result.ErrorMessage, nil)
+			if err != nil {
+				log.Printf("ResultConsumer: failed to update target %s status to %s: %v", result.TargetID, result.Status, err)
+				processedOK = false
+			}
+		} else if result.Status == domain.TaskStatusUserNotFoundByPhone {
+			log.Printf("ResultConsumer: USER_NOT_FOUND_BY_PHONE for target %s (cold search already counted in tenant quota at enqueue)", result.TargetID)
+			_, err := rc.repo.UpdateTargetStatus(processCtx, result.TargetID, domain.TaskStatusUserNotFoundByPhone, result.ErrorMessage, nil)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to update target %s status to %s: %v", result.TargetID, result.Status, err)
 				processedOK = false
@@ -341,68 +395,108 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 			continue
 		}
 
-		// Prepare the task
-		task := domain.TenantAdminNotificationTask{
-			TenantPhone: tenant.AdminPhone,
-			Replies:     replies,
-		}
-
-		// Serialize to JSON
-		payload, err := json.Marshal(task)
-		if err != nil {
-			log.Printf("ResultConsumer: failed to serialize notification task: %v", err)
+		// Parse multiple admin phone numbers separated by semicolons
+		adminPhones := domain.ParseAdminPhones(tenant.AdminPhone)
+		if len(adminPhones) == 0 {
+			log.Printf("ResultConsumer: tenant %s has no valid admin phone numbers after parsing, skipping notification", tenantID)
 			continue
 		}
 
-		// Publish to RabbitMQ
-		publishCtx, cancelPublish := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancelPublish()
+		// For each admin phone number, create a separate notification task
+		for _, adminPhone := range adminPhones {
+			// Try to find a saved chat_id for this specific admin phone number.
+			// If there is one, we send it directly to the chat_id (use_chat_id=true).
+			// If not, we send it to the number (use_chat_id=false). The worker will save the chat_id automatically if successful.
+			adminNormalized := domain.NormalizePhone(adminPhone)
+			var adminChatID string
+			var adminUseChatID bool
+			if adminNormalized != "" {
+				mt := string(domain.DefaultMessengerType)
+				if mapping, err := rc.repo.GetChatPhoneMappingByPhone(tenantCtx, tenantID, adminNormalized, mt); err == nil && mapping != nil && mapping.ChatID != "" {
+					adminChatID = mapping.ChatID
+					adminUseChatID = true
+					log.Printf("ResultConsumer: admin chat_id found in mappings: chat_id=%s tenant=%s phone=%s", adminChatID, tenantID, adminPhone)
+				} else if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+					log.Printf("ResultConsumer: admin chat_id lookup failed (fallback to phone) tenant=%s phone=%s: %v", tenantID, adminPhone, err)
+				}
+			}
 
-		// Check if channel is still alive, reconnect if needed
-		if rc.amqpChan == nil {
-			log.Println("ResultConsumer: channel is nil, trying to reconnect")
-			if err := rc.reconnect(); err != nil {
-				log.Printf("ResultConsumer: failed to reconnect: %v", err)
+			// Prepare the task for this specific phone number
+			task := domain.TenantAdminNotificationTask{
+				TenantID:    tenantID.String(),
+				TenantPhone: adminPhone,
+				ChatID:      adminChatID,
+				UseChatID:   adminUseChatID,
+				Replies:     replies,
+			}
+
+			// Serialize to JSON
+			payload, err := json.Marshal(task)
+			if err != nil {
+				log.Printf("ResultConsumer: failed to serialize notification task for tenant %s phone %s: %v", tenantID, adminPhone, err)
 				continue
 			}
-		}
 
-		err = rc.amqpChan.PublishWithContext(
-			publishCtx,
-			"",                                   // exchange
-			"tasks.messages.tenant_admin_notify", // routing key
-			false,                                // mandatory
-			false,                                // immediate
-			amqp091.Publishing{
-				ContentType: "application/json",
-				Body:        payload,
-			},
-		)
-		if err != nil {
-			log.Printf("ResultConsumer: failed to publish notification: %v, trying to reconnect", err)
-			if err := rc.reconnect(); err == nil {
-				// Try once more after reconnect
-				err = rc.amqpChan.PublishWithContext(
-					publishCtx,
-					"",
-					"tasks.messages.tenant_admin_notify",
-					false,
-					false,
-					amqp091.Publishing{
-						ContentType: "application/json",
-						Body:        payload,
-					},
-				)
-				if err != nil {
-					log.Printf("ResultConsumer: still failed to publish notification: %v", err)
+			delaySec := 45 + rand.IntN(31)
+			log.Printf("ResultConsumer: sleeping for %d seconds before notifying admin (%s)", delaySec, adminPhone)
+
+			select {
+			case <-ctx.Done():
+				log.Printf("ResultConsumer: context canceled during admin notify delay for tenant %s", tenantID)
+				return
+			case <-time.After(time.Duration(delaySec) * time.Second):
+			}
+
+			// Publish to RabbitMQ
+			publishCtx, cancelPublish := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancelPublish()
+
+			// Check if channel is still alive, reconnect if needed
+			if rc.amqpChan == nil {
+				log.Println("ResultConsumer: channel is nil, trying to reconnect")
+				if err := rc.reconnect(); err != nil {
+					log.Printf("ResultConsumer: failed to reconnect: %v", err)
+					continue
+				}
+			}
+
+			err = rc.amqpChan.PublishWithContext(
+				publishCtx,
+				"",                                   // exchange
+				"tasks.messages.tenant_admin_notify", // routing key
+				false,                                // mandatory
+				false,                                // immediate
+				amqp091.Publishing{
+					ContentType: "application/json",
+					Body:        payload,
+				},
+			)
+			if err != nil {
+				log.Printf("ResultConsumer: failed to publish notification for tenant %s phone %s: %v, trying to reconnect", tenantID, adminPhone, err)
+				if err := rc.reconnect(); err == nil {
+					// Try once more after reconnect
+					err = rc.amqpChan.PublishWithContext(
+						publishCtx,
+						"",
+						"tasks.messages.tenant_admin_notify",
+						false,
+						false,
+						amqp091.Publishing{
+							ContentType: "application/json",
+							Body:        payload,
+						},
+					)
+					if err != nil {
+						log.Printf("ResultConsumer: still failed to publish notification for tenant %s phone %s: %v", tenantID, adminPhone, err)
+					} else {
+						log.Printf("ResultConsumer: published notification to tenant %s phone %s (%d replies, chat_id=%s, use_chat_id=%v)", tenantID, adminPhone, len(replies), adminChatID, adminUseChatID)
+					}
 				} else {
-					log.Printf("ResultConsumer: published notification to tenant %s (%d replies)", tenantID, len(replies))
+					log.Printf("ResultConsumer: failed to reconnect for tenant %s phone %s: %v", tenantID, adminPhone, err)
 				}
 			} else {
-				log.Printf("ResultConsumer: failed to reconnect: %v", err)
+				log.Printf("ResultConsumer: published notification to tenant %s phone %s (%d replies, chat_id=%s, use_chat_id=%v)", tenantID, adminPhone, len(replies), adminChatID, adminUseChatID)
 			}
-		} else {
-			log.Printf("ResultConsumer: published notification to tenant %s (%d replies)", tenantID, len(replies))
 		}
 	}
 }
