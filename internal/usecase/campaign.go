@@ -61,6 +61,14 @@ func (uc *CampaignUseCase) UpdateTargetStatus(ctx context.Context, targetID uuid
 	return campaign, nil
 }
 
+func (uc *CampaignUseCase) campaignForTarget(ctx context.Context, targetID uuid.UUID) (*domain.Campaign, error) {
+	target, err := uc.repo.GetCampaignTargetByID(ctx, targetID)
+	if err != nil {
+		return nil, err
+	}
+	return uc.repo.GetCampaign(ctx, target.CampaignID)
+}
+
 func (uc *CampaignUseCase) RegisterReply(ctx context.Context, campaignID uuid.UUID, phone, text string, repliedAt string) (*domain.Campaign, error) {
 	t, err := time.Parse(time.RFC3339, repliedAt)
 	if err != nil {
@@ -234,6 +242,7 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 				target := &domain.CampaignTarget{
 					ID:              targetID,
 					CampaignID:      campaignID,
+					TenantID:        tenantID,
 					ClientName:      row.name,
 					PhoneNormalized: phone,
 					MessengerType:   domain.DefaultMessengerType,

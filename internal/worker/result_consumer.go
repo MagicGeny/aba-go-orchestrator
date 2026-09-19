@@ -4,16 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
-	"github.com/MagicGeny/aba-go-orchestrator/internal/usecase"
-	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
-	"github.com/rabbitmq/amqp091-go"
 	"log"
 	"math/rand/v2"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/MagicGeny/aba-go-orchestrator/internal/config"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/usecase"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/rabbitmq/amqp091-go"
 )
 
 const (
@@ -32,6 +34,7 @@ type ResultConsumer struct {
 	amqpChan  *amqp091.Channel // Added back amqpChan
 	queueName string
 	blocklist BlocklistUpdater
+	cfg       config.Config
 	mu        sync.Mutex
 	isRunning bool
 	results   []queuedResult
@@ -44,13 +47,14 @@ type queuedResult struct {
 	msg    amqp091.Delivery
 }
 
-func NewResultConsumer(repo domain.CampaignRepository, uc *usecase.CampaignUseCase, amqpConn *amqp091.Connection, queueName string, blocklist BlocklistUpdater) (*ResultConsumer, error) {
+func NewResultConsumer(repo domain.CampaignRepository, uc *usecase.CampaignUseCase, amqpConn *amqp091.Connection, queueName string, blocklist BlocklistUpdater, cfg config.Config) (*ResultConsumer, error) {
 	rc := &ResultConsumer{
 		repo:      repo,
 		uc:        uc,
 		amqpConn:  amqpConn,
 		queueName: queueName,
 		blocklist: blocklist,
+		cfg:       cfg,
 		stopChan:  make(chan struct{}),
 	}
 	err := rc.reconnect()
@@ -349,9 +353,19 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 			}
 		} else if result.Status == domain.TaskStatusUserNotFoundByPhone {
 			log.Printf("ResultConsumer: USER_NOT_FOUND_BY_PHONE for target %s (cold search already counted in tenant quota at enqueue)", result.TargetID)
-			_, err := rc.repo.UpdateTargetStatus(processCtx, result.TargetID, domain.TaskStatusUserNotFoundByPhone, result.ErrorMessage, nil)
+			errMsg := result.ErrorMessage
+			if errMsg == nil {
+				msg := "user not found by phone"
+				errMsg = &msg
+			}
+			_, err := rc.repo.UpdateTargetStatus(processCtx, result.TargetID, domain.TaskStatusUserNotFoundByPhone, errMsg, nil)
 			if err != nil {
 				log.Printf("ResultConsumer: failed to update target %s status to %s: %v", result.TargetID, result.Status, err)
+				processedOK = false
+			}
+		} else if isSendFailureResult(result) {
+			if err := rc.handleSendFailure(processCtx, result); err != nil {
+				log.Printf("ResultConsumer: failed to handle send failure for target %s: %v", result.TargetID, err)
 				processedOK = false
 			}
 		} else if result.Status != "" {
@@ -498,5 +512,74 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				log.Printf("ResultConsumer: published notification to tenant %s phone %s (%d replies, chat_id=%s, use_chat_id=%v)", tenantID, adminPhone, len(replies), adminChatID, adminUseChatID)
 			}
 		}
+	}
+}
+
+func isSendFailureResult(result domain.TargetResult) bool {
+	switch result.Status {
+	case domain.TaskStatusFailed, domain.TaskStatusDeliveryUnknown, domain.TaskStatusRetryPending:
+		return true
+	}
+	if result.ErrorCode == "" {
+		return false
+	}
+	switch domain.ClassifyErrorCode(result.ErrorCode) {
+	case domain.DispositionRetryable, domain.DispositionUnknown:
+		return result.Status != domain.TaskStatusSent &&
+			result.Status != domain.TaskStatusDelivered &&
+			result.Status != domain.TaskStatusViewed &&
+			result.Status != domain.TaskStatusReplied
+	default:
+		return false
+	}
+}
+
+func (rc *ResultConsumer) handleSendFailure(ctx context.Context, result domain.TargetResult) error {
+	errorCode := strings.TrimSpace(result.ErrorCode)
+	errMsg := ""
+	if result.ErrorMessage != nil {
+		errMsg = *result.ErrorMessage
+	}
+
+	if errorCode == "" {
+		if result.Status == domain.TaskStatusDeliveryUnknown {
+			errorCode = domain.ErrorCodeDeliveryUnknown
+		} else {
+			// Legacy failed results without structured error_code stay terminal.
+			_, err := rc.repo.UpdateTargetStatus(ctx, result.TargetID, domain.TaskStatusFailed, &errMsg, nil)
+			return err
+		}
+	}
+
+	accountID := result.TenantAccountID
+	if accountID == uuid.Nil && result.AccountID != "" {
+		if aid, err := uuid.Parse(result.AccountID); err == nil {
+			accountID = aid
+		}
+	}
+
+	switch domain.ClassifyErrorCode(errorCode) {
+	case domain.DispositionUnknown:
+		log.Printf("ResultConsumer: DELIVERY_UNKNOWN for target %s — no automatic retry", result.TargetID)
+		return rc.repo.MarkTargetDeliveryUnknown(ctx, result.TargetID, errorCode, errMsg)
+	case domain.DispositionRetryable:
+		next := time.Now().UTC().Add(rc.cfg.RetryDelay())
+		cooldownUntil := time.Time{}
+		if domain.IsSessionHealthError(errorCode) && accountID != uuid.Nil {
+			cooldownUntil = time.Now().UTC().Add(rc.cfg.AccountCooldown())
+		}
+		retried, err := rc.repo.ApplyRetryableFailure(ctx, result.TargetID, accountID, errorCode, errMsg, next, cooldownUntil, rc.cfg.MaxRetryAttempts)
+		if err != nil {
+			return err
+		}
+		if retried {
+			log.Printf("ResultConsumer: target %s -> retry_pending code=%s next=%s account=%s", result.TargetID, errorCode, next.Format(time.RFC3339), accountID)
+		} else {
+			log.Printf("ResultConsumer: target %s exhausted retries or already terminal code=%s", result.TargetID, errorCode)
+		}
+		return nil
+	default:
+		_, err := rc.repo.UpdateTargetStatus(ctx, result.TargetID, domain.TaskStatusFailed, &errMsg, nil)
+		return err
 	}
 }
