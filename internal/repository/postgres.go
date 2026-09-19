@@ -339,9 +339,18 @@ func (r *PostgresRepository) GetCampaignTargetsWithStatus(ctx context.Context, c
 
 func (r *PostgresRepository) CreateReply(ctx context.Context, reply *domain.CampaignReply) error {
 	_, err := r.pool.Exec(ctx, `
-		INSERT INTO campaign_replies (id, campaign_target_id, message_text, received_at)
-		VALUES ($1, $2, $3, $4)
-	`, reply.ID, reply.CampaignTargetID, reply.MessageText, reply.ReceivedAt)
+		INSERT INTO campaign_replies (id, campaign_target_id, message_text, received_at, tenant_id, tenant_account_id)
+		SELECT $1, $2, $3, $4,
+		       ct.tenant_id,
+		       COALESCE(ct.tenant_account_id, (
+		           SELECT ta.id FROM tenant_accounts ta
+		           WHERE ta.tenant_id = ct.tenant_id
+		           ORDER BY ta.created_at ASC, ta.id ASC
+		           LIMIT 1
+		       ))
+		FROM campaign_targets ct
+		WHERE ct.id = $2`,
+		reply.ID, reply.CampaignTargetID, reply.MessageText, reply.ReceivedAt)
 	return err
 }
 
@@ -471,8 +480,17 @@ func (r *PostgresRepository) RegisterReply(ctx context.Context, campaignID uuid.
 		replyID = uuid.New()
 	}
 	_, err = tx.Exec(ctx, `
-		INSERT INTO campaign_replies (id, campaign_target_id, message_text, received_at)
-		VALUES ($1, $2, $3, $4)`,
+		INSERT INTO campaign_replies (id, campaign_target_id, message_text, received_at, tenant_id, tenant_account_id)
+		SELECT $1, $2, $3, $4,
+		       ct.tenant_id,
+		       COALESCE(ct.tenant_account_id, (
+		           SELECT ta.id FROM tenant_accounts ta
+		           WHERE ta.tenant_id = ct.tenant_id
+		           ORDER BY ta.created_at ASC, ta.id ASC
+		           LIMIT 1
+		       ))
+		FROM campaign_targets ct
+		WHERE ct.id = $2`,
 		replyID, targetID, text, repliedAt)
 	if err != nil {
 		return nil, err
@@ -625,12 +643,12 @@ func (r *PostgresRepository) GetChatPhoneMappingByChatID(ctx context.Context, ch
 	var targetID *uuid.UUID
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at,
-			tenant_id, COALESCE(messenger_type, 'MAX')
+			tenant_id, COALESCE(messenger_type, 'MAX'), tenant_account_id
 		FROM chat_phone_mappings
 		WHERE chat_id = $1
 	`, chatID).Scan(
 		&m.ID, &m.ChatID, &campaignID, &targetID, &m.PhoneNormalized, &viewerID, &m.CreatedAt, &m.UpdatedAt,
-		&m.TenantID, &m.MessengerType,
+		&m.TenantID, &m.MessengerType, &m.TenantAccountID,
 	)
 	if err != nil {
 		return nil, err
@@ -662,14 +680,14 @@ func (r *PostgresRepository) GetChatPhoneMappingByPhone(ctx context.Context, ten
 	var targetID *uuid.UUID
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at,
-			tenant_id, COALESCE(messenger_type, 'MAX')
+			tenant_id, COALESCE(messenger_type, 'MAX'), tenant_account_id
 		FROM chat_phone_mappings
 		WHERE tenant_id = $1
 		  AND phone_normalized = $2
 		  AND messenger_type = $3
 	`, tenantID, phone, mt).Scan(
 		&m.ID, &m.ChatID, &campaignID, &targetID, &m.PhoneNormalized, &viewerID, &m.CreatedAt, &m.UpdatedAt,
-		&m.TenantID, &m.MessengerType,
+		&m.TenantID, &m.MessengerType, &m.TenantAccountID,
 	)
 	if err != nil {
 		return nil, err

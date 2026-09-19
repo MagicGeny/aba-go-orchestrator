@@ -50,6 +50,27 @@ func (uc *CampaignUseCase) StopCampaign(ctx context.Context, id uuid.UUID) error
 }
 
 func (uc *CampaignUseCase) UpdateTargetStatus(ctx context.Context, targetID uuid.UUID, status domain.TaskStatus, lastError string, sentAt *time.Time) (*domain.Campaign, error) {
+	return uc.UpdateTargetStatusWithCode(ctx, targetID, status, "", lastError, sentAt)
+}
+
+func (uc *CampaignUseCase) UpdateTargetStatusWithCode(ctx context.Context, targetID uuid.UUID, status domain.TaskStatus, errorCode, lastError string, sentAt *time.Time) (*domain.Campaign, error) {
+	errorCode = strings.TrimSpace(errorCode)
+
+	// Retryable / unknown transitions are owned exclusively by ResultConsumer
+	// (ApplyRetryableFailure) so HTTP callback cannot race the doser before cooldown.
+	if status == domain.TaskStatusFailed || status == domain.TaskStatusDeliveryUnknown || status == domain.TaskStatusRetryPending {
+		if errorCode == "" && status == domain.TaskStatusDeliveryUnknown {
+			errorCode = domain.ErrorCodeDeliveryUnknown
+		}
+		if errorCode != "" {
+			switch domain.ClassifyErrorCode(errorCode) {
+			case domain.DispositionRetryable, domain.DispositionUnknown:
+				log.Printf("UpdateTargetStatusWithCode: deferring %s/%s for target %s to ResultConsumer", status, errorCode, targetID)
+				return uc.campaignForTarget(ctx, targetID)
+			}
+		}
+	}
+
 	var errPtr *string
 	if lastError != "" {
 		errPtr = &lastError
