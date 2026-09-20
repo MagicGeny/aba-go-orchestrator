@@ -127,8 +127,13 @@ func (r *PostgresRepository) UpdateCampaignStatus(ctx context.Context, id uuid.U
 
 func (r *PostgresRepository) GetCampaignTargets(ctx context.Context, campaignID uuid.UUID) ([]*domain.CampaignTarget, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, campaign_id, client_name, phone_normalized, excel_row_index, status, last_error, sent_at, replied_at, last_reply_text, created_at, updated_at, COALESCE(messenger_type, 'MAX')
-		FROM campaign_targets WHERE campaign_id = $1 ORDER BY excel_row_index ASC`, campaignID)
+		SELECT ct.id, ct.campaign_id, ct.client_name, ct.phone_normalized, ct.excel_row_index,
+		       ct.status, ct.last_error, ct.sent_at, ct.replied_at, ct.last_reply_text,
+		       ct.created_at, ct.updated_at, COALESCE(ct.messenger_type, 'MAX'), ta.phone_number
+		FROM campaign_targets ct
+		LEFT JOIN tenant_accounts ta ON ta.id = ct.tenant_account_id
+		WHERE ct.campaign_id = $1
+		ORDER BY ct.excel_row_index ASC`, campaignID)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +142,7 @@ func (r *PostgresRepository) GetCampaignTargets(ctx context.Context, campaignID 
 	var targets []*domain.CampaignTarget
 	for rows.Next() {
 		var t domain.CampaignTarget
-		err := rows.Scan(&t.ID, &t.CampaignID, &t.ClientName, &t.PhoneNormalized, &t.ExcelRowIndex, &t.Status, &t.LastError, &t.SentAt, &t.RepliedAt, &t.LastReplyText, &t.CreatedAt, &t.UpdatedAt, &t.MessengerType)
+		err := rows.Scan(&t.ID, &t.CampaignID, &t.ClientName, &t.PhoneNormalized, &t.ExcelRowIndex, &t.Status, &t.LastError, &t.SentAt, &t.RepliedAt, &t.LastReplyText, &t.CreatedAt, &t.UpdatedAt, &t.MessengerType, &t.SenderAccountPhone)
 		if err != nil {
 			return nil, err
 		}

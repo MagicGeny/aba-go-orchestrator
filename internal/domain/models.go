@@ -133,25 +133,30 @@ type Campaign struct {
 }
 
 type CampaignTarget struct {
-	ID               uuid.UUID  `json:"id"`
-	CampaignID       uuid.UUID  `json:"campaign_id"`
-	TenantID         uuid.UUID  `json:"tenant_id,omitempty"`
-	TenantAccountID  *uuid.UUID `json:"tenant_account_id,omitempty"`
-	ClientName       string     `json:"client_name"`
-	PhoneNormalized  string     `json:"phone_normalized"`
-	MessengerType    string     `json:"messenger_type"`
-	ExcelRowIndex    int        `json:"excel_row_index"`
-	Status           TaskStatus `json:"status"`
-	LastError        *string    `json:"last_error,omitempty"`
-	LastErrorCode    *string    `json:"last_error_code,omitempty"`
-	LastErrorMessage *string    `json:"last_error_message,omitempty"`
-	AttemptCount     int        `json:"attempt_count"`
-	NextAttemptAt    *time.Time `json:"next_attempt_at,omitempty"`
-	SentAt           *time.Time `json:"sent_at,omitempty"`
-	RepliedAt        *time.Time `json:"replied_at,omitempty"`
-	LastReplyText    *string    `json:"last_reply_text,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
+	ID              uuid.UUID  `json:"id"`
+	CampaignID      uuid.UUID  `json:"campaign_id"`
+	TenantID        uuid.UUID  `json:"tenant_id,omitempty"`
+	TenantAccountID *uuid.UUID `json:"tenant_account_id,omitempty"`
+	// SenderAccountPhone is the human-readable phone of the sender account
+	// (tenant_accounts.phone_number) resolved via TenantAccountID. It is filled
+	// only by report queries (GetCampaignTargets) and stays nil when the account
+	// or its phone is unavailable.
+	SenderAccountPhone *string    `json:"sender_account_phone,omitempty"`
+	ClientName         string     `json:"client_name"`
+	PhoneNormalized    string     `json:"phone_normalized"`
+	MessengerType      string     `json:"messenger_type"`
+	ExcelRowIndex      int        `json:"excel_row_index"`
+	Status             TaskStatus `json:"status"`
+	LastError          *string    `json:"last_error,omitempty"`
+	LastErrorCode      *string    `json:"last_error_code,omitempty"`
+	LastErrorMessage   *string    `json:"last_error_message,omitempty"`
+	AttemptCount       int        `json:"attempt_count"`
+	NextAttemptAt      *time.Time `json:"next_attempt_at,omitempty"`
+	SentAt             *time.Time `json:"sent_at,omitempty"`
+	RepliedAt          *time.Time `json:"replied_at,omitempty"`
+	LastReplyText      *string    `json:"last_reply_text,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
 type OutboxMessage struct {
