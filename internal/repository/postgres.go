@@ -44,13 +44,17 @@ func (r *PostgresRepository) CreateCampaign(ctx context.Context, campaign *domai
 		if messengerType == "" {
 			messengerType = domain.DefaultMessengerType
 		}
-		targetRows[i] = []any{t.ID, t.CampaignID, t.ClientName, t.PhoneNormalized, t.ExcelRowIndex, t.Status, messengerType}
+		tenantID := t.TenantID
+		if tenantID == uuid.Nil {
+			tenantID = campaign.TenantID
+		}
+		targetRows[i] = []any{t.ID, t.CampaignID, tenantID, t.ClientName, t.PhoneNormalized, t.ExcelRowIndex, t.Status, messengerType}
 	}
 
 	_, err = tx.CopyFrom(
 		ctx,
 		pgx.Identifier{"campaign_targets"},
-		[]string{"id", "campaign_id", "client_name", "phone_normalized", "excel_row_index", "status", "messenger_type"},
+		[]string{"id", "campaign_id", "tenant_id", "client_name", "phone_normalized", "excel_row_index", "status", "messenger_type"},
 		pgx.CopyFromRows(targetRows),
 	)
 	if err != nil {
@@ -123,8 +127,13 @@ func (r *PostgresRepository) UpdateCampaignStatus(ctx context.Context, id uuid.U
 
 func (r *PostgresRepository) GetCampaignTargets(ctx context.Context, campaignID uuid.UUID) ([]*domain.CampaignTarget, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, campaign_id, client_name, phone_normalized, excel_row_index, status, last_error, sent_at, replied_at, last_reply_text, created_at, updated_at, COALESCE(messenger_type, 'MAX')
-		FROM campaign_targets WHERE campaign_id = $1 ORDER BY excel_row_index ASC`, campaignID)
+		SELECT ct.id, ct.campaign_id, ct.client_name, ct.phone_normalized, ct.excel_row_index,
+		       ct.status, ct.last_error, ct.sent_at, ct.replied_at, ct.last_reply_text,
+		       ct.created_at, ct.updated_at, COALESCE(ct.messenger_type, 'MAX'), ta.phone_number
+		FROM campaign_targets ct
+		LEFT JOIN tenant_accounts ta ON ta.id = ct.tenant_account_id
+		WHERE ct.campaign_id = $1
+		ORDER BY ct.excel_row_index ASC`, campaignID)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +142,7 @@ func (r *PostgresRepository) GetCampaignTargets(ctx context.Context, campaignID 
 	var targets []*domain.CampaignTarget
 	for rows.Next() {
 		var t domain.CampaignTarget
-		err := rows.Scan(&t.ID, &t.CampaignID, &t.ClientName, &t.PhoneNormalized, &t.ExcelRowIndex, &t.Status, &t.LastError, &t.SentAt, &t.RepliedAt, &t.LastReplyText, &t.CreatedAt, &t.UpdatedAt, &t.MessengerType)
+		err := rows.Scan(&t.ID, &t.CampaignID, &t.ClientName, &t.PhoneNormalized, &t.ExcelRowIndex, &t.Status, &t.LastError, &t.SentAt, &t.RepliedAt, &t.LastReplyText, &t.CreatedAt, &t.UpdatedAt, &t.MessengerType, &t.SenderAccountPhone)
 		if err != nil {
 			return nil, err
 		}
@@ -186,11 +195,15 @@ func (r *PostgresRepository) GetTargetsByStatus(ctx context.Context, campaignID 
 
 func (r *PostgresRepository) GetPendingMessages(ctx context.Context, limit int) ([]*domain.OutboxMessage, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, event_type, payload, status, created_at
-		FROM outbox_messages 
-		WHERE status = 'pending' AND publish_at <= NOW()
-		ORDER BY publish_at ASC
-		FOR UPDATE SKIP LOCKED 
+		SELECT o.id, o.event_type, o.payload, o.status, o.created_at,
+		       COALESCE(o.tenant_id, '00000000-0000-0000-0000-000000000000'::uuid),
+		       COALESCE(o.tenant_account_id, '00000000-0000-0000-0000-000000000000'::uuid),
+		       COALESCE(ta.account_key, '')
+		FROM outbox_messages o
+		LEFT JOIN tenant_accounts ta ON ta.id = o.tenant_account_id
+		WHERE o.status = 'pending' AND o.publish_at <= NOW()
+		ORDER BY o.publish_at ASC
+		FOR UPDATE OF o SKIP LOCKED
 		LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -200,7 +213,7 @@ func (r *PostgresRepository) GetPendingMessages(ctx context.Context, limit int) 
 	var messages []*domain.OutboxMessage
 	for rows.Next() {
 		var m domain.OutboxMessage
-		err := rows.Scan(&m.ID, &m.EventType, &m.Payload, &m.Status, &m.CreatedAt)
+		err := rows.Scan(&m.ID, &m.EventType, &m.Payload, &m.Status, &m.CreatedAt, &m.TenantID, &m.TenantAccountID, &m.AccountKey)
 		if err != nil {
 			return nil, err
 		}
@@ -331,9 +344,18 @@ func (r *PostgresRepository) GetCampaignTargetsWithStatus(ctx context.Context, c
 
 func (r *PostgresRepository) CreateReply(ctx context.Context, reply *domain.CampaignReply) error {
 	_, err := r.pool.Exec(ctx, `
-		INSERT INTO campaign_replies (id, campaign_target_id, message_text, received_at)
-		VALUES ($1, $2, $3, $4)
-	`, reply.ID, reply.CampaignTargetID, reply.MessageText, reply.ReceivedAt)
+		INSERT INTO campaign_replies (id, campaign_target_id, message_text, received_at, tenant_id, tenant_account_id)
+		SELECT $1, $2, $3, $4,
+		       ct.tenant_id,
+		       COALESCE(ct.tenant_account_id, (
+		           SELECT ta.id FROM tenant_accounts ta
+		           WHERE ta.tenant_id = ct.tenant_id
+		           ORDER BY ta.created_at ASC, ta.id ASC
+		           LIMIT 1
+		       ))
+		FROM campaign_targets ct
+		WHERE ct.id = $2`,
+		reply.ID, reply.CampaignTargetID, reply.MessageText, reply.ReceivedAt)
 	return err
 }
 
@@ -463,8 +485,17 @@ func (r *PostgresRepository) RegisterReply(ctx context.Context, campaignID uuid.
 		replyID = uuid.New()
 	}
 	_, err = tx.Exec(ctx, `
-		INSERT INTO campaign_replies (id, campaign_target_id, message_text, received_at)
-		VALUES ($1, $2, $3, $4)`,
+		INSERT INTO campaign_replies (id, campaign_target_id, message_text, received_at, tenant_id, tenant_account_id)
+		SELECT $1, $2, $3, $4,
+		       ct.tenant_id,
+		       COALESCE(ct.tenant_account_id, (
+		           SELECT ta.id FROM tenant_accounts ta
+		           WHERE ta.tenant_id = ct.tenant_id
+		           ORDER BY ta.created_at ASC, ta.id ASC
+		           LIMIT 1
+		       ))
+		FROM campaign_targets ct
+		WHERE ct.id = $2`,
 		replyID, targetID, text, repliedAt)
 	if err != nil {
 		return nil, err
@@ -566,8 +597,14 @@ func (r *PostgresRepository) UpsertChatPhoneMapping(ctx context.Context, mapping
 	}
 
 	_, err := r.pool.Exec(ctx, `
-		INSERT INTO chat_phone_mappings (id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at, tenant_id, messenger_type)
-		SELECT $1, $2, $3, $4, $5, $6, $7, $8, c.tenant_id, COALESCE(NULLIF($9, ''), ct.messenger_type, 'MAX')
+		INSERT INTO chat_phone_mappings (id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at, tenant_id, messenger_type, tenant_account_id)
+		SELECT $1, $2, $3, $4, $5, $6, $7, $8, c.tenant_id, COALESCE(NULLIF($9, ''), ct.messenger_type, 'MAX'),
+		       COALESCE(ct.tenant_account_id, (
+		           SELECT ta.id FROM tenant_accounts ta
+		           WHERE ta.tenant_id = c.tenant_id
+		           ORDER BY ta.created_at ASC, ta.id ASC
+		           LIMIT 1
+		       ))
 		FROM campaigns c
 		JOIN campaign_targets ct ON ct.id = $4 AND ct.campaign_id = c.id
 		WHERE c.id = $3
@@ -578,6 +615,7 @@ func (r *PostgresRepository) UpsertChatPhoneMapping(ctx context.Context, mapping
 			viewer_id = EXCLUDED.viewer_id,
 			tenant_id = EXCLUDED.tenant_id,
 			messenger_type = EXCLUDED.messenger_type,
+			tenant_account_id = COALESCE(EXCLUDED.tenant_account_id, chat_phone_mappings.tenant_account_id),
 			updated_at = EXCLUDED.updated_at
 	`, mapping.ID, mapping.ChatID, mapping.CampaignID, mapping.CampaignTargetID, mapping.PhoneNormalized, mapping.ViewerID, mapping.CreatedAt, mapping.UpdatedAt, mapping.MessengerType)
 	if err == nil {
@@ -610,12 +648,12 @@ func (r *PostgresRepository) GetChatPhoneMappingByChatID(ctx context.Context, ch
 	var targetID *uuid.UUID
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at,
-			tenant_id, COALESCE(messenger_type, 'MAX')
+			tenant_id, COALESCE(messenger_type, 'MAX'), tenant_account_id
 		FROM chat_phone_mappings
 		WHERE chat_id = $1
 	`, chatID).Scan(
 		&m.ID, &m.ChatID, &campaignID, &targetID, &m.PhoneNormalized, &viewerID, &m.CreatedAt, &m.UpdatedAt,
-		&m.TenantID, &m.MessengerType,
+		&m.TenantID, &m.MessengerType, &m.TenantAccountID,
 	)
 	if err != nil {
 		return nil, err
@@ -647,14 +685,14 @@ func (r *PostgresRepository) GetChatPhoneMappingByPhone(ctx context.Context, ten
 	var targetID *uuid.UUID
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at,
-			tenant_id, COALESCE(messenger_type, 'MAX')
+			tenant_id, COALESCE(messenger_type, 'MAX'), tenant_account_id
 		FROM chat_phone_mappings
 		WHERE tenant_id = $1
 		  AND phone_normalized = $2
 		  AND messenger_type = $3
 	`, tenantID, phone, mt).Scan(
 		&m.ID, &m.ChatID, &campaignID, &targetID, &m.PhoneNormalized, &viewerID, &m.CreatedAt, &m.UpdatedAt,
-		&m.TenantID, &m.MessengerType,
+		&m.TenantID, &m.MessengerType, &m.TenantAccountID,
 	)
 	if err != nil {
 		return nil, err
@@ -692,12 +730,18 @@ func (r *PostgresRepository) UpsertAdminChatMapping(ctx context.Context, chatID 
 	}
 	now := time.Now().UTC()
 	_, err = r.pool.Exec(ctx, `
-		INSERT INTO chat_phone_mappings (id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at, tenant_id, messenger_type)
-		VALUES ($1, $2, NULL, NULL, $3, NULL, $4, $4, $5, $6)
+		INSERT INTO chat_phone_mappings (id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at, tenant_id, messenger_type, tenant_account_id)
+		VALUES ($1, $2, NULL, NULL, $3, NULL, $4, $4, $5, $6, (
+			SELECT ta.id FROM tenant_accounts ta
+			WHERE ta.tenant_id = $5
+			ORDER BY ta.created_at ASC, ta.id ASC
+			LIMIT 1
+		))
 		ON CONFLICT (chat_id) DO UPDATE
 		SET phone_normalized = EXCLUDED.phone_normalized,
 			tenant_id        = EXCLUDED.tenant_id,
 			messenger_type   = EXCLUDED.messenger_type,
+			tenant_account_id = COALESCE(chat_phone_mappings.tenant_account_id, EXCLUDED.tenant_account_id),
 			updated_at       = EXCLUDED.updated_at
 	`, id, chatID, phone, now, tenantID, mt)
 	if err != nil {

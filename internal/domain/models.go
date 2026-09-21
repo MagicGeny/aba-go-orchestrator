@@ -41,6 +41,8 @@ const (
 	TaskStatusFailed              TaskStatus = "failed"
 	TaskStatusReplied             TaskStatus = "replied"
 	TaskStatusUserNotFoundByPhone TaskStatus = "user_not_found_by_phone"
+	TaskStatusRetryPending        TaskStatus = "retry_pending"
+	TaskStatusDeliveryUnknown     TaskStatus = "delivery_unknown"
 )
 
 const (
@@ -66,13 +68,17 @@ func (s TaskStatus) StatusText() string {
 		return "Ответ получен"
 	case TaskStatusUserNotFoundByPhone:
 		return "Пользователь не найден"
+	case TaskStatusRetryPending:
+		return "Ожидает повторной отправки"
+	case TaskStatusDeliveryUnknown:
+		return "Статус доставки неизвестен"
 	default:
 		return "Неизвестно"
 	}
 }
 
 func (s TaskStatus) IsErrorStatus() bool {
-	return s == TaskStatusFailed || s == TaskStatusUserNotFoundByPhone
+	return s == TaskStatusFailed || s == TaskStatusUserNotFoundByPhone || s == TaskStatusDeliveryUnknown
 }
 
 // Rank is used so viewed/replied cannot be overwritten by an earlier status.
@@ -84,7 +90,7 @@ func (s TaskStatus) Rank() int {
 		return 3
 	case TaskStatusSent, TaskStatusDelivered:
 		return 2
-	case TaskStatusPending:
+	case TaskStatusPending, TaskStatusRetryPending:
 		return 1
 	default:
 		return 0
@@ -129,35 +135,89 @@ type Campaign struct {
 type CampaignTarget struct {
 	ID              uuid.UUID  `json:"id"`
 	CampaignID      uuid.UUID  `json:"campaign_id"`
-	ClientName      string     `json:"client_name"`
-	PhoneNormalized string     `json:"phone_normalized"`
-	MessengerType   string     `json:"messenger_type"`
-	ExcelRowIndex   int        `json:"excel_row_index"`
-	Status          TaskStatus `json:"status"`
-	LastError       *string    `json:"last_error,omitempty"`
-	SentAt          *time.Time `json:"sent_at,omitempty"`
-	RepliedAt       *time.Time `json:"replied_at,omitempty"`
-	LastReplyText   *string    `json:"last_reply_text,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	TenantID        uuid.UUID  `json:"tenant_id,omitempty"`
+	TenantAccountID *uuid.UUID `json:"tenant_account_id,omitempty"`
+	// SenderAccountPhone is the human-readable phone of the sender account
+	// (tenant_accounts.phone_number) resolved via TenantAccountID. It is filled
+	// only by report queries (GetCampaignTargets) and stays nil when the account
+	// or its phone is unavailable.
+	SenderAccountPhone *string    `json:"sender_account_phone,omitempty"`
+	ClientName         string     `json:"client_name"`
+	PhoneNormalized    string     `json:"phone_normalized"`
+	MessengerType      string     `json:"messenger_type"`
+	ExcelRowIndex      int        `json:"excel_row_index"`
+	Status             TaskStatus `json:"status"`
+	LastError          *string    `json:"last_error,omitempty"`
+	LastErrorCode      *string    `json:"last_error_code,omitempty"`
+	LastErrorMessage   *string    `json:"last_error_message,omitempty"`
+	AttemptCount       int        `json:"attempt_count"`
+	NextAttemptAt      *time.Time `json:"next_attempt_at,omitempty"`
+	SentAt             *time.Time `json:"sent_at,omitempty"`
+	RepliedAt          *time.Time `json:"replied_at,omitempty"`
+	LastReplyText      *string    `json:"last_reply_text,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
 type OutboxMessage struct {
-	ID          uuid.UUID  `json:"id"`
-	EventType   string     `json:"event_type"`
-	Payload     []byte     `json:"payload"`
-	Status      string     `json:"status"`
-	CreatedAt   time.Time  `json:"created_at"`
-	ProcessedAt *time.Time `json:"processed_at,omitempty"`
+	ID              uuid.UUID  `json:"id"`
+	EventType       string     `json:"event_type"`
+	Payload         []byte     `json:"payload"`
+	Status          string     `json:"status"`
+	TenantID        uuid.UUID  `json:"tenant_id,omitempty"`
+	TenantAccountID uuid.UUID  `json:"tenant_account_id,omitempty"`
+	AccountKey      string     `json:"account_key,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	ProcessedAt     *time.Time `json:"processed_at,omitempty"`
 }
 
 type CampaignReply struct {
-	ID               uuid.UUID `json:"id"`
-	CampaignTargetID uuid.UUID `json:"campaign_target_id"`
-	MessageText      string    `json:"message_text"`
-	ReceivedAt       time.Time `json:"received_at"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID               uuid.UUID  `json:"id"`
+	CampaignTargetID uuid.UUID  `json:"campaign_target_id"`
+	TenantID         uuid.UUID  `json:"tenant_id,omitempty"`
+	TenantAccountID  *uuid.UUID `json:"tenant_account_id,omitempty"`
+	MessageText      string     `json:"message_text"`
+	ReceivedAt       time.Time  `json:"received_at"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+}
+
+type TenantAccount struct {
+	ID            uuid.UUID  `json:"id"`
+	TenantID      uuid.UUID  `json:"tenant_id"`
+	AccountKey    string     `json:"account_key"`
+	PhoneNumber   string     `json:"phone_number"`
+	ProxyURL      string     `json:"proxy_url"`
+	Status        string     `json:"status"`
+	DailyLimit    int        `json:"daily_limit"`
+	CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
+	UsedToday     int        `json:"used_today,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+}
+
+func (a *TenantAccount) RemainingToday() int {
+	if a == nil {
+		return 0
+	}
+	left := a.DailyLimit - a.UsedToday
+	if left < 0 {
+		return 0
+	}
+	return left
+}
+
+func (a *TenantAccount) IsAssignable(now time.Time) bool {
+	if a == nil {
+		return false
+	}
+	if a.Status == AccountStatusDisabled {
+		return false
+	}
+	if a.Status == AccountStatusCooldown && a.CooldownUntil != nil && a.CooldownUntil.After(now) {
+		return false
+	}
+	return a.RemainingToday() > 0
 }
 
 type BlockedRecipient struct {
@@ -175,6 +235,7 @@ type ChatPhoneMapping struct {
 	CampaignTargetID uuid.UUID `json:"campaign_target_id"`
 	PhoneNormalized  string    `json:"phone_normalized"`
 	TenantID         uuid.UUID `json:"tenant_id"`
+	TenantAccountID  uuid.UUID `json:"tenant_account_id,omitempty"`
 	MessengerType    string    `json:"messenger_type"`
 	ViewerID         *int64    `json:"viewer_id,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
@@ -193,45 +254,52 @@ type TenantDailyQuota struct {
 }
 
 type PendingTargetForDosing struct {
-	TargetID        uuid.UUID
-	CampaignID      uuid.UUID
-	TenantID        uuid.UUID
-	ClientName      string
-	PhoneNormalized string
-	MessageTemplate string
-	ChatID          string
-	IsWarm          bool
-	MessengerType   string
-	AttachmentURL   *string
-	AttachmentName  *string
+	TargetID         uuid.UUID
+	CampaignID       uuid.UUID
+	TenantID         uuid.UUID
+	ClientName       string
+	PhoneNormalized  string
+	MessageTemplate  string
+	ChatID           string
+	IsWarm           bool
+	MessengerType    string
+	AttachmentURL    *string
+	AttachmentName   *string
+	PreferredAccount *uuid.UUID // warm mapping account when known
+	AttemptCount     int
 }
 
 type SendTaskPayload struct {
-	TaskID         string  `json:"task_id"`
-	CampaignID     string  `json:"campaign_id"`
-	TenantID       string  `json:"tenant_id"`
-	Messenger      string  `json:"messenger"`
-	MessengerType  string  `json:"messenger_type,omitempty"`
-	Phone          string  `json:"phone"`
-	MessageText    string  `json:"message_text"`
-	UseChatID      bool    `json:"use_chat_id"`
-	ChatID         string  `json:"chat_id,omitempty"`
-	ContactType    string  `json:"contact_type,omitempty"`
-	AttachmentURL  *string `json:"attachment_url,omitempty"`
-	AttachmentName *string `json:"attachment_name,omitempty"`
+	TaskID          string  `json:"task_id"`
+	CampaignID      string  `json:"campaign_id"`
+	TenantID        string  `json:"tenant_id"`
+	TenantAccountID string  `json:"tenant_account_id,omitempty"`
+	AccountID       string  `json:"account_id,omitempty"` // UUID string; same as tenant_account_id (routing identity)
+	Messenger       string  `json:"messenger"`
+	MessengerType   string  `json:"messenger_type,omitempty"`
+	Phone           string  `json:"phone"`
+	MessageText     string  `json:"message_text"`
+	UseChatID       bool    `json:"use_chat_id"`
+	ChatID          string  `json:"chat_id,omitempty"`
+	ContactType     string  `json:"contact_type,omitempty"`
+	AttachmentURL   *string `json:"attachment_url,omitempty"`
+	AttachmentName  *string `json:"attachment_name,omitempty"`
 }
 
 type TargetResult struct {
-	TargetID      uuid.UUID  `json:"target_id"`
-	CampaignID    uuid.UUID  `json:"campaign_id"`
-	TenantID      uuid.UUID  `json:"tenant_id,omitempty"`
-	PhoneNumber   string     `json:"phone_number"`
-	Status        TaskStatus `json:"status"`
-	ReplyText     *string    `json:"reply_text,omitempty"`
-	ErrorMessage  *string    `json:"error_message,omitempty"`
-	Timestamp     time.Time  `json:"timestamp"`
-	ChatID        string     `json:"chat_id,omitempty"`
-	MessengerType string     `json:"messenger_type,omitempty"`
+	TargetID        uuid.UUID  `json:"target_id"`
+	CampaignID      uuid.UUID  `json:"campaign_id"`
+	TenantID        uuid.UUID  `json:"tenant_id,omitempty"`
+	TenantAccountID uuid.UUID  `json:"tenant_account_id,omitempty"`
+	AccountID       string     `json:"account_id,omitempty"`
+	PhoneNumber     string     `json:"phone_number"`
+	Status          TaskStatus `json:"status"`
+	ReplyText       *string    `json:"reply_text,omitempty"`
+	ErrorCode       string     `json:"error_code,omitempty"`
+	ErrorMessage    *string    `json:"error_message,omitempty"`
+	Timestamp       time.Time  `json:"timestamp"`
+	ChatID          string     `json:"chat_id,omitempty"`
+	MessengerType   string     `json:"messenger_type,omitempty"`
 }
 
 func parseOptionalUUID(raw string) (uuid.UUID, error) {
@@ -246,16 +314,19 @@ func parseOptionalUUID(raw string) (uuid.UUID, error) {
 // (admin notify results send target_id="" which encoding/json rejects).
 func (r *TargetResult) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		TargetID      string     `json:"target_id"`
-		CampaignID    string     `json:"campaign_id"`
-		TenantID      string     `json:"tenant_id"`
-		PhoneNumber   string     `json:"phone_number"`
-		Status        TaskStatus `json:"status"`
-		ReplyText     *string    `json:"reply_text"`
-		ErrorMessage  *string    `json:"error_message"`
-		Timestamp     time.Time  `json:"timestamp"`
-		ChatID        string     `json:"chat_id"`
-		MessengerType string     `json:"messenger_type"`
+		TargetID        string     `json:"target_id"`
+		CampaignID      string     `json:"campaign_id"`
+		TenantID        string     `json:"tenant_id"`
+		TenantAccountID string     `json:"tenant_account_id"`
+		AccountID       string     `json:"account_id"`
+		PhoneNumber     string     `json:"phone_number"`
+		Status          TaskStatus `json:"status"`
+		ReplyText       *string    `json:"reply_text"`
+		ErrorCode       string     `json:"error_code"`
+		ErrorMessage    *string    `json:"error_message"`
+		Timestamp       time.Time  `json:"timestamp"`
+		ChatID          string     `json:"chat_id"`
+		MessengerType   string     `json:"messenger_type"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -270,9 +341,14 @@ func (r *TargetResult) UnmarshalJSON(data []byte) error {
 	if r.TenantID, err = parseOptionalUUID(raw.TenantID); err != nil {
 		return err
 	}
+	if r.TenantAccountID, err = parseOptionalUUID(raw.TenantAccountID); err != nil {
+		return err
+	}
+	r.AccountID = raw.AccountID
 	r.PhoneNumber = raw.PhoneNumber
 	r.Status = raw.Status
 	r.ReplyText = raw.ReplyText
+	r.ErrorCode = raw.ErrorCode
 	r.ErrorMessage = raw.ErrorMessage
 	r.Timestamp = raw.Timestamp
 	r.ChatID = raw.ChatID
@@ -327,6 +403,19 @@ type CampaignRepository interface {
 	GetNextPendingWarmTarget(ctx context.Context, tenantID uuid.UUID) (*PendingTargetForDosing, error)
 	GetNextPendingColdTarget(ctx context.Context, tenantID uuid.UUID) (*PendingTargetForDosing, error)
 	CreateDosedOutboxMessage(ctx context.Context, tenantID uuid.UUID, eventType string, payload []byte, publishAt time.Time) error
+	// AssignAccountAndEnqueueTarget persists the selected account on the target,
+	// increments account daily usage, and inserts a new outbox row (never deletes old ones).
+	AssignAccountAndEnqueueTarget(ctx context.Context, targetID, tenantID, accountID uuid.UUID, eventType string, payload []byte, publishAt time.Time) error
+	ListAssignableTenantAccounts(ctx context.Context, tenantID uuid.UUID, quotaDate time.Time, now time.Time) ([]*TenantAccount, error)
+	GetTenantAccountByID(ctx context.Context, accountID uuid.UUID) (*TenantAccount, error)
+	GetTenantAccountByKey(ctx context.Context, tenantID uuid.UUID, accountKey string) (*TenantAccount, error)
+	MarkAccountCooldown(ctx context.Context, accountID uuid.UUID, until time.Time) error
+	MarkTargetRetryPending(ctx context.Context, targetID uuid.UUID, errorCode, errorMessage string, nextAttemptAt time.Time, maxAttempts int) (retried bool, err error)
+	// ApplyRetryableFailure atomically cools down the account (when session-health)
+	// and moves the target to retry_pending. Idempotent if already retry_pending/failed.
+	ApplyRetryableFailure(ctx context.Context, targetID, accountID uuid.UUID, errorCode, errorMessage string, nextAttemptAt, cooldownUntil time.Time, maxAttempts int) (retried bool, err error)
+	MarkTargetDeliveryUnknown(ctx context.Context, targetID uuid.UUID, errorCode, errorMessage string) error
+	DeferRetryTargetsWithoutAccounts(ctx context.Context, tenantID uuid.UUID, nextAttemptAt time.Time) error
 	// TryReserveColdSlot atomically takes a cold send slot if the daily limit
 	// and minInterval have been satisfied. Returns false when the tenant must wait.
 	TryReserveColdSlot(ctx context.Context, tenantID uuid.UUID, quotaDate time.Time, at time.Time, minInterval time.Duration) (bool, error)

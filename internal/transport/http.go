@@ -180,8 +180,10 @@ func (h *HTTPHandler) WorkerCallback(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
 		TaskID       uuid.UUID `json:"task_id"`
 		Status       string    `json:"status"`
+		ErrorCode    string    `json:"error_code"`
 		ErrorMessage string    `json:"error_message"`
 		SentAt       string    `json:"sent_at"`
+		AccountID    string    `json:"account_id"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
@@ -201,7 +203,7 @@ func (h *HTTPHandler) WorkerCallback(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	campaign, err := h.campaignUC.UpdateTargetStatus(ctx, payload.TaskID, domain.TaskStatus(payload.Status), payload.ErrorMessage, sentAt)
+	campaign, err := h.campaignUC.UpdateTargetStatusWithCode(ctx, payload.TaskID, domain.TaskStatus(payload.Status), payload.ErrorCode, payload.ErrorMessage, sentAt)
 	if err != nil {
 		log.Printf("UpdateTargetStatus error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -215,7 +217,6 @@ func (h *HTTPHandler) WorkerCallback(w http.ResponseWriter, r *http.Request) {
 		"processed_count": campaign.ProcessedCount,
 		"total_count":     campaign.TotalCount,
 		"error_count":     campaign.ErrorCount,
-		// "replied_count":  ... (we'll need to count targets with replied status or add column)
 	})
 
 	w.WriteHeader(http.StatusOK)

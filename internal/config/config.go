@@ -28,22 +28,31 @@ type Config struct {
 	WorkWindowEndMinute    int
 	Location               *time.Location
 	DisableAutoPolling     bool
+	MaxRetryAttempts       int
+	RetryDelayMinutes      int
+	AccountCooldownMinutes int
+	RabbitMQSendExchange   string
 }
 
 func LoadFromEnv() Config {
+	//config args
 	cfg := Config{
 		LimitColdMin:           envInt("LIMIT_COLD_MIN", 141),
 		LimitColdMax:           envInt("LIMIT_COLD_MAX", 159),
 		LimitColdEstimatedAvg:  envInt("LIMIT_COLD_ESTIMATED_AVG", 150),
 		LimitWarmDaily:         envInt("LIMIT_WARM_DAILY", 500),
-		WorkWindowStart:        envString("WORK_WINDOW_START", "09:15"),
-		WorkWindowEnd:          envString("WORK_WINDOW_END", "20:45"),
+		WorkWindowStart:        envString("WORK_WINDOW_START", "10:01"),
+		WorkWindowEnd:          envString("WORK_WINDOW_END", "20:50"),
 		IntervalColdMinMinutes: envInt("INTERVAL_COLD_MIN_MINUTES", 1),
 		IntervalColdMaxMinutes: envInt("INTERVAL_COLD_MAX_MINUTES", 5),
 		IntervalWarmMinMinutes: envInt("INTERVAL_WARM_MIN_MINUTES", 1),
 		IntervalWarmMaxMinutes: envInt("INTERVAL_WARM_MAX_MINUTES", 1),
 		Location:               loadLocation(),
 		DisableAutoPolling:     envBool("DISABLE_AUTO_POLLING", true),
+		MaxRetryAttempts:       envInt("MAX_RETRY_ATTEMPTS", 3),
+		RetryDelayMinutes:      envInt("RETRY_DELAY_MINUTES", 15),
+		AccountCooldownMinutes: envInt("ACCOUNT_COOLDOWN_MINUTES", 60),
+		RabbitMQSendExchange:   envString("RABBITMQ_SEND_EXCHANGE", "tasks.messages.direct"),
 	}
 	parseWorkWindow(&cfg)
 	log.Printf("config: timezone=%s work_window=%s-%s cold_interval=%d-%d min warm_interval=%d-%d min",
@@ -84,6 +93,32 @@ func (c Config) RandomWarmInterval() time.Duration {
 		minutes = min + rand.Intn(max-min+1)
 	}
 	return time.Duration(minutes) * time.Minute
+}
+
+func (c Config) RetryDelay() time.Duration {
+	mins := c.RetryDelayMinutes
+	if mins < 1 {
+		mins = 15
+	}
+	return time.Duration(mins) * time.Minute
+}
+
+func (c Config) AccountCooldown() time.Duration {
+	mins := c.AccountCooldownMinutes
+	if mins < 1 {
+		mins = 60
+	}
+	return time.Duration(mins) * time.Minute
+}
+
+// NextDayWorkStart returns the next work-window start after `now` in the configured timezone.
+func (c Config) NextDayWorkStart(now time.Time) time.Time {
+	local := now.In(c.Location)
+	start := time.Date(local.Year(), local.Month(), local.Day(), c.WorkWindowStartHour, c.WorkWindowStartMinute, 0, 0, c.Location)
+	if !local.Before(start) {
+		start = start.AddDate(0, 0, 1)
+	}
+	return start.UTC()
 }
 
 func envString(key, fallback string) string {

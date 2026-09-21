@@ -50,6 +50,27 @@ func (uc *CampaignUseCase) StopCampaign(ctx context.Context, id uuid.UUID) error
 }
 
 func (uc *CampaignUseCase) UpdateTargetStatus(ctx context.Context, targetID uuid.UUID, status domain.TaskStatus, lastError string, sentAt *time.Time) (*domain.Campaign, error) {
+	return uc.UpdateTargetStatusWithCode(ctx, targetID, status, "", lastError, sentAt)
+}
+
+func (uc *CampaignUseCase) UpdateTargetStatusWithCode(ctx context.Context, targetID uuid.UUID, status domain.TaskStatus, errorCode, lastError string, sentAt *time.Time) (*domain.Campaign, error) {
+	errorCode = strings.TrimSpace(errorCode)
+
+	// Retryable / unknown transitions are owned exclusively by ResultConsumer
+	// (ApplyRetryableFailure) so HTTP callback cannot race the doser before cooldown.
+	if status == domain.TaskStatusFailed || status == domain.TaskStatusDeliveryUnknown || status == domain.TaskStatusRetryPending {
+		if errorCode == "" && status == domain.TaskStatusDeliveryUnknown {
+			errorCode = domain.ErrorCodeDeliveryUnknown
+		}
+		if errorCode != "" {
+			switch domain.ClassifyErrorCode(errorCode) {
+			case domain.DispositionRetryable, domain.DispositionUnknown:
+				log.Printf("UpdateTargetStatusWithCode: deferring %s/%s for target %s to ResultConsumer", status, errorCode, targetID)
+				return uc.campaignForTarget(ctx, targetID)
+			}
+		}
+	}
+
 	var errPtr *string
 	if lastError != "" {
 		errPtr = &lastError
@@ -59,6 +80,14 @@ func (uc *CampaignUseCase) UpdateTargetStatus(ctx context.Context, targetID uuid
 		return nil, err
 	}
 	return campaign, nil
+}
+
+func (uc *CampaignUseCase) campaignForTarget(ctx context.Context, targetID uuid.UUID) (*domain.Campaign, error) {
+	target, err := uc.repo.GetCampaignTargetByID(ctx, targetID)
+	if err != nil {
+		return nil, err
+	}
+	return uc.repo.GetCampaign(ctx, target.CampaignID)
 }
 
 func (uc *CampaignUseCase) RegisterReply(ctx context.Context, campaignID uuid.UUID, phone, text string, repliedAt string) (*domain.Campaign, error) {
@@ -234,6 +263,7 @@ func (uc *CampaignUseCase) UploadCampaign(ctx context.Context, tenantID uuid.UUI
 				target := &domain.CampaignTarget{
 					ID:              targetID,
 					CampaignID:      campaignID,
+					TenantID:        tenantID,
 					ClientName:      row.name,
 					PhoneNormalized: phone,
 					MessengerType:   domain.DefaultMessengerType,
@@ -425,6 +455,7 @@ func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UU
 	statusCol := ""
 	replyCol := ""
 	replyTimeCol := ""
+	senderPhoneCol := ""
 	headerRow := rows[0]
 	for colIdx, colVal := range headerRow {
 		colName, _ := excelize.ColumnNumberToName(colIdx + 1)
@@ -434,9 +465,11 @@ func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UU
 			replyCol = colName
 		} else if colVal == "Время получения ответа" {
 			replyTimeCol = colName
+		} else if colVal == "Телефон аккаунта рассылки" {
+			senderPhoneCol = colName
 		}
 	}
-	log.Printf("GenerateExcel: Columns found: status=%s, reply=%s, replyTime=%s", statusCol, replyCol, replyTimeCol)
+	log.Printf("GenerateExcel: Columns found: status=%s, reply=%s, replyTime=%s, senderPhone=%s", statusCol, replyCol, replyTimeCol, senderPhoneCol)
 
 	lastCol := len(headerRow)
 	if statusCol == "" {
@@ -461,6 +494,26 @@ func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UU
 		cell, _ := excelize.JoinCellName(replyTimeCol, 1)
 		f.SetCellValue(sheetName, cell, "Время получения ответа")
 		log.Printf("GenerateExcel: Added reply time column at: %s", replyTimeCol)
+	}
+	// Sender account phone column: always placed immediately after
+	// "Время получения ответа". InsertCols keeps any columns to the right intact
+	// (their cells, styles, widths and filters shift along with them).
+	if senderPhoneCol == "" {
+		replyTimeNum, err := excelize.ColumnNameToNumber(replyTimeCol)
+		if err != nil || replyTimeNum < 1 || replyTimeNum+1 > excelize.MaxColumns {
+			return "", fmt.Errorf("failed to resolve sender account phone column after %q: %v", replyTimeCol, err)
+		}
+		colName, err := excelize.ColumnNumberToName(replyTimeNum + 1)
+		if err != nil {
+			return "", fmt.Errorf("failed to resolve sender account phone column name: %w", err)
+		}
+		if err := f.InsertCols(sheetName, colName, 1); err != nil {
+			return "", fmt.Errorf("failed to insert sender account phone column: %w", err)
+		}
+		senderPhoneCol = colName
+		cell, _ := excelize.JoinCellName(senderPhoneCol, 1)
+		f.SetCellValue(sheetName, cell, "Телефон аккаунта рассылки")
+		log.Printf("GenerateExcel: Added sender account phone column at: %s", senderPhoneCol)
 	}
 
 	for rowNum := 1; rowNum < len(rows); rowNum++ {
@@ -498,6 +551,13 @@ func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UU
 			}
 		}
 
+		// Sender account phone (tenant_accounts.phone_number); empty for legacy
+		// rows where the account or its phone is unavailable.
+		var senderPhoneText string
+		if ok && target.SenderAccountPhone != nil {
+			senderPhoneText = strings.TrimSpace(*target.SenderAccountPhone)
+		}
+
 		statusCell, _ := excelize.JoinCellName(statusCol, rowNum+1)
 		f.SetCellValue(sheetName, statusCell, statusText)
 
@@ -506,6 +566,9 @@ func (uc *CampaignUseCase) GenerateExcel(ctx context.Context, campaignID uuid.UU
 
 		replyTimeCell, _ := excelize.JoinCellName(replyTimeCol, rowNum+1)
 		f.SetCellValue(sheetName, replyTimeCell, replyTimeText)
+
+		senderPhoneCell, _ := excelize.JoinCellName(senderPhoneCol, rowNum+1)
+		f.SetCellValue(sheetName, senderPhoneCell, senderPhoneText)
 	}
 
 	processedFilename := generateSemanticFilename(campaign.Name+"_processed_"+uuid.NewString(), time.Now().UTC(), ".xlsx")

@@ -157,7 +157,7 @@ func main() {
 	}
 	go replyPoller.Run(ctx)
 
-	resultConsumer, err := worker.NewResultConsumer(repo, campaignUC, amqpConn, "tasks.messages.results_replies_queue", blocklistCache)
+	resultConsumer, err := worker.NewResultConsumer(repo, campaignUC, amqpConn, "tasks.messages.results_replies_queue", blocklistCache, cfg)
 	if err != nil {
 		log.Fatalf("failed to init result consumer: %v", err)
 	}

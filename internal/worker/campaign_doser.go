@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/text/cases"
@@ -16,14 +17,21 @@ import (
 	"github.com/google/uuid"
 )
 
-// CampaignDoser schedules outbox messages per tenant respecting cold/warm daily limits.
+// CampaignDoser schedules outbox messages per tenant respecting cold/warm daily limits
+// and distributes send tasks across tenant accounts with simple Round-Robin.
 type CampaignDoser struct {
-	repo domain.CampaignRepository
-	cfg  config.Config
+	repo     domain.CampaignRepository
+	cfg      config.Config
+	rrMu     sync.Mutex
+	rrCursor map[uuid.UUID]int
 }
 
 func NewCampaignDoser(repo domain.CampaignRepository, cfg config.Config) *CampaignDoser {
-	return &CampaignDoser{repo: repo, cfg: cfg}
+	return &CampaignDoser{
+		repo:     repo,
+		cfg:      cfg,
+		rrCursor: make(map[uuid.UUID]int),
+	}
 }
 
 func (d *CampaignDoser) Run(ctx context.Context) {
@@ -60,6 +68,18 @@ func (d *CampaignDoser) doseTenant(ctx context.Context, tenantID uuid.UUID) erro
 	now := time.Now().In(d.cfg.Location)
 	quotaDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, d.cfg.Location)
 
+	accounts, err := d.repo.ListAssignableTenantAccounts(ctx, tenantID, quotaDate, now)
+	if err != nil {
+		return err
+	}
+	if len(accounts) == 0 {
+		next := d.cfg.NextDayWorkStart(now)
+		if err := d.repo.DeferRetryTargetsWithoutAccounts(ctx, tenantID, next); err != nil {
+			log.Printf("CampaignDoser: tenant %s defer retries failed: %v", tenantID, err)
+		}
+		return nil
+	}
+
 	quota, err := d.repo.GetOrCreateTenantDailyQuota(ctx, tenantID, quotaDate, d.cfg.LimitColdMin, d.cfg.LimitColdMax)
 	if err != nil {
 		return err
@@ -71,7 +91,7 @@ func (d *CampaignDoser) doseTenant(ctx context.Context, tenantID uuid.UUID) erro
 			return err
 		}
 		if target != nil {
-			return d.scheduleTarget(ctx, target, quotaDate, now, false, 0)
+			return d.scheduleTarget(ctx, target, accounts, quotaDate, now, false, 0)
 		}
 	}
 
@@ -95,14 +115,41 @@ func (d *CampaignDoser) doseTenant(ctx context.Context, tenantID uuid.UUID) erro
 	if target == nil {
 		return nil
 	}
-	return d.scheduleTarget(ctx, target, quotaDate, now, true, interval)
+	return d.scheduleTarget(ctx, target, accounts, quotaDate, now, true, interval)
 }
 
 func CapitalizeText(s string) string {
 	return cases.Title(language.Russian).String(strings.ToLower(strings.TrimSpace(s)))
 }
 
-func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.PendingTargetForDosing, quotaDate, now time.Time, isCold bool, interval time.Duration) error {
+func (d *CampaignDoser) pickAccount(tenantID uuid.UUID, accounts []*domain.TenantAccount, preferred *uuid.UUID) *domain.TenantAccount {
+	if len(accounts) == 0 {
+		return nil
+	}
+	if preferred != nil {
+		for _, a := range accounts {
+			if a.ID == *preferred {
+				return a
+			}
+		}
+	}
+
+	d.rrMu.Lock()
+	defer d.rrMu.Unlock()
+	cursor := d.rrCursor[tenantID]
+	idx := cursor % len(accounts)
+	d.rrCursor[tenantID] = cursor + 1
+	return accounts[idx]
+}
+
+func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.PendingTargetForDosing, accounts []*domain.TenantAccount, quotaDate, now time.Time, isCold bool, interval time.Duration) error {
+	account := d.pickAccount(target.TenantID, accounts, target.PreferredAccount)
+	if account == nil {
+		next := d.cfg.NextDayWorkStart(now)
+		_ = d.repo.DeferRetryTargetsWithoutAccounts(ctx, target.TenantID, next)
+		return nil
+	}
+
 	messageText := strings.ReplaceAll(target.MessageTemplate, "{user_name}", CapitalizeText(target.ClientName))
 	contactType := "warm"
 	useChatID := target.IsWarm && target.ChatID != ""
@@ -122,18 +169,20 @@ func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.Pendi
 	}
 
 	payload, err := json.Marshal(domain.SendTaskPayload{
-		TaskID:         target.TargetID.String(),
-		CampaignID:     target.CampaignID.String(),
-		TenantID:       target.TenantID.String(),
-		Messenger:      strings.ToLower(messengerType),
-		MessengerType:  messengerType,
-		Phone:          target.PhoneNormalized,
-		MessageText:    messageText,
-		UseChatID:      useChatID,
-		ChatID:         target.ChatID,
-		ContactType:    contactType,
-		AttachmentURL:  target.AttachmentURL,
-		AttachmentName: target.AttachmentName,
+		TaskID:          target.TargetID.String(),
+		CampaignID:      target.CampaignID.String(),
+		TenantID:        target.TenantID.String(),
+		TenantAccountID: account.ID.String(),
+		AccountID:       account.ID.String(), // routing identity = tenant_account_id UUID
+		Messenger:       strings.ToLower(messengerType),
+		MessengerType:   messengerType,
+		Phone:           target.PhoneNormalized,
+		MessageText:     messageText,
+		UseChatID:       useChatID,
+		ChatID:          target.ChatID,
+		ContactType:     contactType,
+		AttachmentURL:   target.AttachmentURL,
+		AttachmentName:  target.AttachmentName,
 	})
 	if err != nil {
 		return err
@@ -148,13 +197,19 @@ func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.Pendi
 		if !reserved {
 			return nil
 		}
-		return d.repo.CreateDosedOutboxMessage(ctx, target.TenantID, eventType, payload, at)
+		if err := d.repo.AssignAccountAndEnqueueTarget(ctx, target.TargetID, target.TenantID, account.ID, eventType, payload, at); err != nil {
+			log.Printf("CampaignDoser: enqueue failed target=%s tenant_account_id=%s key=%s: %v", target.TargetID, account.ID, account.AccountKey, err)
+			return nil
+		}
+		log.Printf("CampaignDoser: cold target=%s tenant_account_id=%s key=%s", target.TargetID, account.ID, account.AccountKey)
+		return nil
 	}
 
-	// For warm messages, apply the interval delay
 	warmPublishAt := at.Add(interval)
-	if err := d.repo.CreateDosedOutboxMessage(ctx, target.TenantID, eventType, payload, warmPublishAt); err != nil {
-		return err
+	if err := d.repo.AssignAccountAndEnqueueTarget(ctx, target.TargetID, target.TenantID, account.ID, eventType, payload, warmPublishAt); err != nil {
+		log.Printf("CampaignDoser: warm enqueue failed target=%s tenant_account_id=%s key=%s: %v", target.TargetID, account.ID, account.AccountKey, err)
+		return nil
 	}
+	log.Printf("CampaignDoser: warm target=%s tenant_account_id=%s key=%s", target.TargetID, account.ID, account.AccountKey)
 	return d.repo.IncrementWarmUsed(ctx, target.TenantID, quotaDate)
 }
