@@ -14,6 +14,7 @@ import (
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/config"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/logging"
 	"github.com/google/uuid"
 )
 
@@ -142,6 +143,29 @@ func (d *CampaignDoser) pickAccount(tenantID uuid.UUID, accounts []*domain.Tenan
 	return accounts[idx]
 }
 
+// doseTrace builds the correlation fields for the dosing diagnostics
+// (TARGET_DOSED / TARGET_DOSE_FAILED). The CampaignTarget -> OutboxMessage
+// step of the lifecycle is recorded here, with the attempt number that only
+// the doser knows.
+func doseTrace(target *domain.PendingTargetForDosing, account *domain.TenantAccount, messengerType, contactType, eventType string, useChatID bool, publishAt time.Time) map[string]any {
+	return logging.Fields(
+		"task_id", target.TargetID.String(),
+		"target_id", target.TargetID.String(),
+		"campaign_id", target.CampaignID.String(),
+		"tenant_id", target.TenantID.String(),
+		"tenant_account_id", account.ID.String(),
+		"account_key", account.AccountKey,
+		"messenger_type", messengerType,
+		"contact_type", contactType,
+		"phone", logging.MaskPhone(target.PhoneNormalized),
+		"use_chat_id", useChatID,
+		"chat_id", target.ChatID,
+		"outbox_event_type", eventType,
+		"attempt", target.AttemptCount,
+		"publish_at", publishAt.UTC().Format(time.RFC3339),
+	)
+}
+
 func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.PendingTargetForDosing, accounts []*domain.TenantAccount, quotaDate, now time.Time, isCold bool, interval time.Duration) error {
 	account := d.pickAccount(target.TenantID, accounts, target.PreferredAccount)
 	if account == nil {
@@ -199,17 +223,27 @@ func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.Pendi
 		}
 		if err := d.repo.AssignAccountAndEnqueueTarget(ctx, target.TargetID, target.TenantID, account.ID, eventType, payload, at); err != nil {
 			log.Printf("CampaignDoser: enqueue failed target=%s tenant_account_id=%s key=%s: %v", target.TargetID, account.ID, account.AccountKey, err)
+			logging.Error("TARGET_DOSE_FAILED", logging.WithFields(
+				doseTrace(target, account, messengerType, contactType, eventType, useChatID, at),
+				"error", err.Error(),
+			))
 			return nil
 		}
 		log.Printf("CampaignDoser: cold target=%s tenant_account_id=%s key=%s", target.TargetID, account.ID, account.AccountKey)
+		logging.Info("TARGET_DOSED", doseTrace(target, account, messengerType, contactType, eventType, useChatID, at))
 		return nil
 	}
 
 	warmPublishAt := at.Add(interval)
 	if err := d.repo.AssignAccountAndEnqueueTarget(ctx, target.TargetID, target.TenantID, account.ID, eventType, payload, warmPublishAt); err != nil {
 		log.Printf("CampaignDoser: warm enqueue failed target=%s tenant_account_id=%s key=%s: %v", target.TargetID, account.ID, account.AccountKey, err)
+		logging.Error("TARGET_DOSE_FAILED", logging.WithFields(
+			doseTrace(target, account, messengerType, contactType, eventType, useChatID, warmPublishAt),
+			"error", err.Error(),
+		))
 		return nil
 	}
 	log.Printf("CampaignDoser: warm target=%s tenant_account_id=%s key=%s", target.TargetID, account.ID, account.AccountKey)
+	logging.Info("TARGET_DOSED", doseTrace(target, account, messengerType, contactType, eventType, useChatID, warmPublishAt))
 	return d.repo.IncrementWarmUsed(ctx, target.TenantID, quotaDate)
 }

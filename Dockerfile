@@ -17,5 +17,9 @@ WORKDIR /app
 COPY --from=builder /app/orchestrator .
 COPY --from=builder /app/db/migrations ./db/migrations
 
+# Rotating diagnostic logs (logs/orchestrator.log). Created up-front so the
+# directory can be mounted as a volume and is writable without extra setup.
+RUN mkdir -p /app/logs
+
 EXPOSE 8080
 CMD ["./orchestrator"]

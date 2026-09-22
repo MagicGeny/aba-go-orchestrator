@@ -10,6 +10,7 @@ import (
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/config"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/logging"
 	"github.com/google/uuid"
 	"github.com/rabbitmq/amqp091-go"
 )
@@ -28,6 +29,9 @@ type OutboxWorker struct {
 	sendExchange  string
 	blockChecker  BlockChecker
 	cfg           config.Config
+	// tracedQueues deduplicates the per-account queue/binding diagnostics.
+	// Only touched from processMessages, which runs on the single Run loop.
+	tracedQueues map[string]struct{}
 }
 
 const (
@@ -45,11 +49,68 @@ func AccountSendQueue(tenantAccountID string) string {
 	return "tasks.messages.send.account." + tenantAccountID
 }
 
+// outboxSendTask mirrors the JSON payload produced by CampaignDoser for a send
+// task. It is used for diagnostics ONLY: the raw payload (msg.Payload) is what
+// gets published, byte for byte, so the worker contract stays untouched.
+type outboxSendTask struct {
+	TaskID          string `json:"task_id"`
+	CampaignID      string `json:"campaign_id"`
+	TenantID        string `json:"tenant_id"`
+	TenantAccountID string `json:"tenant_account_id"`
+	AccountID       string `json:"account_id"`
+	Messenger       string `json:"messenger"`
+	MessengerType   string `json:"messenger_type"`
+	Phone           string `json:"phone"`
+	MessageText     string `json:"message_text"`
+	UseChatID       bool   `json:"use_chat_id"`
+	ChatID          string `json:"chat_id"`
+	ContactType     string `json:"contact_type"`
+	// Attempt is decoded defensively: the payload does not carry it today
+	// (the authoritative retry attempt is logged by CampaignDoser's
+	// TARGET_DOSED event) but if it ever appears it is reported as-is.
+	AttemptCount   int     `json:"attempt"`
+	AttachmentURL  *string `json:"attachment_url,omitempty"`
+	AttachmentName *string `json:"attachment_name,omitempty"`
+}
+
+// publishTrace builds the correlation identifier set shared by
+// WORKER_TASK_PUBLISH_START, WORKER_TASK_PUBLISHED and
+// WORKER_TASK_PUBLISH_FAILED so one task can be followed from its
+// CampaignTarget row, through the OutboxMessage row, into the worker queue.
+func publishTrace(msg *domain.OutboxMessage, task *outboxSendTask, tenantAccountID, exchange, routingKey, queue string) map[string]any {
+	return logging.Fields(
+		"outbox_id", msg.ID.String(),
+		"outbox_event_type", msg.EventType,
+		"task_id", task.TaskID,
+		// Worker contract: the task_id published to the worker IS the
+		// campaign_targets.id, so it doubles as the target identifier.
+		"target_id", task.TaskID,
+		"campaign_id", task.CampaignID,
+		"tenant_id", task.TenantID,
+		"tenant_account_id", tenantAccountID,
+		"account_key", msg.AccountKey,
+		"messenger", task.Messenger,
+		"messenger_type", task.MessengerType,
+		"contact_type", task.ContactType,
+		// Full MSISDN is not needed for diagnostics, so only a masked form is
+		// persisted (the payload itself is unchanged).
+		"phone", logging.MaskPhone(task.Phone),
+		"use_chat_id", task.UseChatID,
+		"chat_id", task.ChatID,
+		"exchange", exchange,
+		"routing_key", routingKey,
+		"queue", queue,
+		"attempt", task.AttemptCount,
+	)
+}
+
 func NewOutboxWorker(repo domain.OutboxRepository, amqpConn *amqp091.Connection, queueName string, warmQueueName string, resultsQueue string, blockChecker BlockChecker, cfg config.Config) (*OutboxWorker, error) {
 	ch, err := amqpConn.Channel()
 	if err != nil {
+		logging.Error("RABBITMQ_CHANNEL_OPEN_FAILED", logging.Fields("component", "outbox", "error", err.Error()))
 		return nil, err
 	}
+	logging.Info("RABBITMQ_CHANNEL_OPENED", logging.Fields("component", "outbox"))
 
 	sendExchange := strings.TrimSpace(cfg.RabbitMQSendExchange)
 	if sendExchange == "" {
@@ -64,12 +125,21 @@ func NewOutboxWorker(repo domain.OutboxRepository, amqpConn *amqp091.Connection,
 		false, // no-wait
 		nil,
 	); err != nil {
+		logging.Error("RABBITMQ_EXCHANGE_DECLARE_FAILED", logging.Fields(
+			"component", "outbox", "exchange", sendExchange, "error", err.Error(),
+		))
 		return nil, fmt.Errorf("declare send exchange %s: %w", sendExchange, err)
 	}
+	logging.Info("RABBITMQ_EXCHANGE_DECLARED", logging.Fields(
+		"component", "outbox", "exchange", sendExchange, "exchange_type", "direct", "durable", true,
+	))
 
 	// Confirm mode: mark outbox processed only after broker ack when supported.
 	if err := ch.Confirm(false); err != nil {
 		log.Printf("[outbox] publisher confirms unavailable (%v); falling back to fire-and-forget publish", err)
+		logging.Warn("RABBITMQ_PUBLISHER_CONFIRMS_UNAVAILABLE", logging.Fields(
+			"component", "outbox", "error", err.Error(),
+		))
 	}
 
 	for _, q := range []string{queueName, warmQueueName, resultsQueue} {
@@ -85,8 +155,14 @@ func NewOutboxWorker(repo domain.OutboxRepository, amqpConn *amqp091.Connection,
 			nil,   // arguments
 		)
 		if err != nil {
+			logging.Error("RABBITMQ_QUEUE_DECLARE_FAILED", logging.Fields(
+				"component", "outbox", "queue", q, "error", err.Error(),
+			))
 			return nil, err
 		}
+		logging.Info("RABBITMQ_QUEUE_DECLARED", logging.Fields(
+			"component", "outbox", "queue", q, "durable", true,
+		))
 	}
 
 	return &OutboxWorker{
@@ -128,12 +204,37 @@ func (w *OutboxWorker) ensureAccountQueue(tenantAccountID string) (queueName str
 		nil,
 	)
 	if err != nil {
+		logging.Error("RABBITMQ_QUEUE_DECLARE_FAILED", logging.Fields(
+			"component", "outbox", "queue", queueName, "tenant_account_id", tenantAccountID, "error", err.Error(),
+		))
 		return "", "", err
 	}
 	if err := w.amqpChan.QueueBind(queueName, routingKey, w.sendExchange, false, nil); err != nil {
+		logging.Error("RABBITMQ_QUEUE_BIND_FAILED", logging.Fields(
+			"component", "outbox", "queue", queueName, "routing_key", routingKey,
+			"exchange", w.sendExchange, "tenant_account_id", tenantAccountID, "error", err.Error(),
+		))
 		return "", "", err
 	}
+	// Per-account queue/binding is idempotent, but log it only when it is
+	// newly created/ensured for this process run to avoid per-publish noise.
+	w.traceAccountQueueOnce(queueName, routingKey)
 	return queueName, routingKey, nil
+}
+
+// traceAccountQueueOnce emits the per-account queue/binding diagnostic at most
+// once per process run, keeping the log useful without per-publish noise.
+func (w *OutboxWorker) traceAccountQueueOnce(queueName, routingKey string) {
+	if w.tracedQueues == nil {
+		w.tracedQueues = make(map[string]struct{})
+	}
+	if _, seen := w.tracedQueues[queueName]; seen {
+		return
+	}
+	w.tracedQueues[queueName] = struct{}{}
+	logging.Info("RABBITMQ_ACCOUNT_QUEUE_BOUND", logging.Fields(
+		"component", "outbox", "queue", queueName, "routing_key", routingKey, "exchange", w.sendExchange,
+	))
 }
 
 func resolveTenantAccountID(msg *domain.OutboxMessage, payloadTenantAccountID, payloadAccountID string) string {
@@ -162,21 +263,7 @@ func (w *OutboxWorker) processMessages(ctx context.Context) {
 	processedIDs := make([]uuid.UUID, 0, len(messages))
 
 	for _, msg := range messages {
-		var sendTask struct {
-			TaskID          string  `json:"task_id"`
-			CampaignID      string  `json:"campaign_id"`
-			TenantID        string  `json:"tenant_id"`
-			TenantAccountID string  `json:"tenant_account_id"`
-			AccountID       string  `json:"account_id"`
-			Messenger       string  `json:"messenger"`
-			Phone           string  `json:"phone"`
-			MessageText     string  `json:"message_text"`
-			UseChatID       bool    `json:"use_chat_id"`
-			ChatID          string  `json:"chat_id"`
-			ContactType     string  `json:"contact_type"`
-			AttachmentURL   *string `json:"attachment_url,omitempty"`
-			AttachmentName  *string `json:"attachment_name,omitempty"`
-		}
+		var sendTask outboxSendTask
 		_ = json.Unmarshal(msg.Payload, &sendTask)
 
 		if strings.EqualFold(sendTask.ContactType, "cold") && !w.cfg.IsWithinWorkWindow(time.Now()) {
@@ -245,6 +332,11 @@ func (w *OutboxWorker) processMessages(ctx context.Context) {
 			msg.ID, w.sendExchange, routingKey, queueName, sendTask.TaskID, sendTask.CampaignID, sendTask.Phone, sendTask.UseChatID,
 			tenantAccountID, strDeref(sendTask.AttachmentURL), strDeref(sendTask.AttachmentName))
 
+		// --- Diagnostic: worker task publish (logging only) ---
+		trace := publishTrace(msg, &sendTask, tenantAccountID, w.sendExchange, routingKey, queueName)
+		logging.Info("WORKER_TASK_PUBLISH_START", trace)
+		publishStartedAt := time.Now()
+
 		confirmation, pubErr := w.amqpChan.PublishWithDeferredConfirmWithContext(ctx,
 			w.sendExchange,
 			routingKey,
@@ -257,20 +349,35 @@ func (w *OutboxWorker) processMessages(ctx context.Context) {
 			},
 		)
 		if pubErr != nil {
+			logging.Error("WORKER_TASK_PUBLISH_FAILED", logging.WithFields(trace,
+				"error", pubErr.Error(),
+				"publish_duration_ms", time.Since(publishStartedAt).Milliseconds(),
+			))
 			log.Printf("failed to publish message %s: %v", msg.ID, pubErr)
 			continue
 		}
 		if confirmation != nil {
 			acked, confErr := confirmation.WaitContext(ctx)
 			if confErr != nil {
+				logging.Error("WORKER_TASK_PUBLISH_FAILED", logging.WithFields(trace,
+					"error", confErr.Error(),
+					"publish_duration_ms", time.Since(publishStartedAt).Milliseconds(),
+				))
 				log.Printf("failed waiting for publish confirm message %s: %v", msg.ID, confErr)
 				continue
 			}
 			if !acked {
+				logging.Error("WORKER_TASK_PUBLISH_FAILED", logging.WithFields(trace,
+					"error", "broker nacked the message",
+					"publish_duration_ms", time.Since(publishStartedAt).Milliseconds(),
+				))
 				log.Printf("broker nacked message %s — leaving outbox pending", msg.ID)
 				continue
 			}
 		}
+		logging.Info("WORKER_TASK_PUBLISHED", logging.WithFields(trace,
+			"publish_duration_ms", time.Since(publishStartedAt).Milliseconds(),
+		))
 
 		processedIDs = append(processedIDs, msg.ID)
 	}

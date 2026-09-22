@@ -8,9 +8,30 @@ import (
 	"time"
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/logging"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
+
+// retryTransitionFields builds the correlation fields for the
+// TARGET_STATUS_UPDATE_* diagnostics emitted by the retry pipeline. These
+// events are logging only: they never influence the returned values.
+func retryTransitionFields(targetID, accountID uuid.UUID, oldStatus, newStatus domain.TaskStatus, attemptCount, maxAttempts int, errorCode string) map[string]any {
+	account := ""
+	if accountID != uuid.Nil {
+		account = accountID.String()
+	}
+	return logging.Fields(
+		"target_id", targetID.String(),
+		"task_id", targetID.String(),
+		"account_id", account,
+		"old_status", string(oldStatus),
+		"new_status", string(newStatus),
+		"attempt_count", attemptCount,
+		"max_attempts", maxAttempts,
+		"error_code", errorCode,
+	)
+}
 
 func quotaDateParam(quotaDate time.Time) string {
 	return quotaDate.Format("2006-01-02")
@@ -358,18 +379,39 @@ func (r *PostgresRepository) ApplyRetryableFailure(ctx context.Context, targetID
 		SELECT COALESCE(attempt_count, 0), status
 		FROM campaign_targets WHERE id = $1 FOR UPDATE`, targetID).Scan(&attemptCount, &status)
 	if err != nil {
+		logging.Error("TARGET_STATUS_UPDATE_FAILED", logging.Fields(
+			"target_id", targetID.String(),
+			"task_id", targetID.String(),
+			"new_status", string(domain.TaskStatusRetryPending),
+			"error_code", errorCode,
+			"error", err.Error(),
+		))
 		return false, err
 	}
 
 	switch status {
 	case domain.TaskStatusRetryPending:
 		// Already awaiting retry — treat as success (idempotent).
+		logging.Info("TARGET_STATUS_UPDATED", logging.WithFields(
+			retryTransitionFields(targetID, accountID, status, status, attemptCount, maxAttempts, errorCode),
+			"retried", true,
+			"no_change", true,
+			"reason", "already_retry_pending",
+		))
 		return true, tx.Commit(ctx)
 	case domain.TaskStatusDeliveryUnknown, domain.TaskStatusFailed, domain.TaskStatusUserNotFoundByPhone,
 		domain.TaskStatusSent, domain.TaskStatusDelivered, domain.TaskStatusViewed, domain.TaskStatusReplied:
 		// Terminal or success — do not reopen.
+		logging.Info("TARGET_STATUS_UPDATED", logging.WithFields(
+			retryTransitionFields(targetID, accountID, status, status, attemptCount, maxAttempts, errorCode),
+			"retried", false,
+			"no_change", true,
+			"reason", "already_terminal",
+		))
 		return false, tx.Commit(ctx)
 	}
+
+	fields := retryTransitionFields(targetID, accountID, status, domain.TaskStatusRetryPending, attemptCount, maxAttempts, errorCode)
 
 	if accountID != uuid.Nil && domain.IsSessionHealthError(errorCode) && !cooldownUntil.IsZero() {
 		_, err = tx.Exec(ctx, `
@@ -377,11 +419,23 @@ func (r *PostgresRepository) ApplyRetryableFailure(ctx context.Context, targetID
 			SET status = 'cooldown', cooldown_until = $2, updated_at = NOW()
 			WHERE id = $1 AND status <> 'disabled'`, accountID, cooldownUntil.UTC())
 		if err != nil {
+			logging.Error("TARGET_STATUS_UPDATE_FAILED", logging.WithFields(fields,
+				"account_cooldown_until", cooldownUntil.UTC().Format(time.RFC3339),
+				"error", err.Error()))
 			return false, err
 		}
+		logging.Info("ACCOUNT_COOLDOWN_APPLIED", logging.Fields(
+			"account_id", accountID.String(),
+			"target_id", targetID.String(),
+			"error_code", errorCode,
+			"cooldown_until", cooldownUntil.UTC().Format(time.RFC3339),
+		))
 	}
 
 	if attemptCount >= maxAttempts {
+		fields["new_status"] = string(domain.TaskStatusFailed)
+		logging.Info("TARGET_STATUS_UPDATE_START", logging.WithFields(fields,
+			"reason", "retries_exhausted"))
 		_, err = tx.Exec(ctx, `
 			UPDATE campaign_targets
 			SET status = 'failed',
@@ -392,11 +446,23 @@ func (r *PostgresRepository) ApplyRetryableFailure(ctx context.Context, targetID
 			    updated_at = NOW()
 			WHERE id = $1`, targetID, errorMessage, errorCode)
 		if err != nil {
+			logging.Error("TARGET_STATUS_UPDATE_FAILED", logging.WithFields(fields, "error", err.Error()))
 			return false, err
 		}
-		return false, tx.Commit(ctx)
+		if err := tx.Commit(ctx); err != nil {
+			logging.Error("TARGET_STATUS_UPDATE_FAILED", logging.WithFields(fields, "error", err.Error()))
+			return false, err
+		}
+		logging.Info("TARGET_STATUS_UPDATED", logging.WithFields(fields,
+			"retried", false,
+			"reason", "retries_exhausted",
+		))
+		return false, nil
 	}
 
+	logging.Info("TARGET_STATUS_UPDATE_START", logging.WithFields(fields,
+		"next_attempt_at", nextAttemptAt.UTC().Format(time.RFC3339),
+	))
 	_, err = tx.Exec(ctx, `
 		UPDATE campaign_targets
 		SET status = 'retry_pending',
@@ -407,13 +473,28 @@ func (r *PostgresRepository) ApplyRetryableFailure(ctx context.Context, targetID
 		    updated_at = NOW()
 		WHERE id = $1`, targetID, errorMessage, errorCode, nextAttemptAt.UTC())
 	if err != nil {
+		logging.Error("TARGET_STATUS_UPDATE_FAILED", logging.WithFields(fields, "error", err.Error()))
 		return false, err
 	}
-	return true, tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		logging.Error("TARGET_STATUS_UPDATE_FAILED", logging.WithFields(fields, "error", err.Error()))
+		return false, err
+	}
+	logging.Info("TARGET_STATUS_UPDATED", logging.WithFields(fields,
+		"retried", true,
+		"next_attempt_at", nextAttemptAt.UTC().Format(time.RFC3339),
+	))
+	return true, nil
 }
 
 func (r *PostgresRepository) MarkTargetDeliveryUnknown(ctx context.Context, targetID uuid.UUID, errorCode, errorMessage string) error {
-	_, err := r.pool.Exec(ctx, `
+	logging.Info("TARGET_STATUS_UPDATE_START", logging.Fields(
+		"target_id", targetID.String(),
+		"task_id", targetID.String(),
+		"new_status", string(domain.TaskStatusDeliveryUnknown),
+		"error_code", errorCode,
+	))
+	tag, err := r.pool.Exec(ctx, `
 		UPDATE campaign_targets
 		SET status = 'delivery_unknown',
 		    last_error = $2,
@@ -424,7 +505,26 @@ func (r *PostgresRepository) MarkTargetDeliveryUnknown(ctx context.Context, targ
 		WHERE id = $1
 		  AND status NOT IN ('sent', 'delivered', 'viewed', 'replied', 'delivery_unknown')`,
 		targetID, errorMessage, errorCode)
-	return err
+	if err != nil {
+		logging.Error("TARGET_STATUS_UPDATE_FAILED", logging.Fields(
+			"target_id", targetID.String(),
+			"task_id", targetID.String(),
+			"new_status", string(domain.TaskStatusDeliveryUnknown),
+			"error_code", errorCode,
+			"error", err.Error(),
+		))
+		return err
+	}
+	logging.Info("TARGET_STATUS_UPDATED", logging.Fields(
+		"target_id", targetID.String(),
+		"task_id", targetID.String(),
+		"new_status", string(domain.TaskStatusDeliveryUnknown),
+		"error_code", errorCode,
+		// applied=false means the target was already sent/delivered/viewed,
+		// i.e. the guard in the SQL intentionally kept it unchanged.
+		"applied", tag.RowsAffected() == 1,
+	))
+	return nil
 }
 
 func (r *PostgresRepository) DeferRetryTargetsWithoutAccounts(ctx context.Context, tenantID uuid.UUID, nextAttemptAt time.Time) error {

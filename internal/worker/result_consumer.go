@@ -12,6 +12,7 @@ import (
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/config"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/logging"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/usecase"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -22,6 +23,43 @@ const (
 	batchSize     = 1
 	flushInterval = 55 * time.Second
 )
+
+// resultTrace builds the correlation identifier set used by the worker-result
+// diagnostics. It mirrors the identifiers used when the task was published
+// (WORKER_TASK_PUBLISH_*) so a single target can be followed end to end.
+func resultTrace(result *domain.TargetResult) map[string]any {
+	accountID := result.TenantAccountID.String()
+	if result.TenantAccountID == uuid.Nil {
+		accountID = result.AccountID
+	}
+	trace := logging.Fields(
+		"task_id", result.TargetID.String(),
+		// The worker task_id IS campaign_targets.id.
+		"target_id", result.TargetID.String(),
+		"campaign_id", result.CampaignID.String(),
+		"tenant_id", result.TenantID.String(),
+		"tenant_account_id", accountID,
+		"messenger_type", result.MessengerType,
+		"chat_id", result.ChatID,
+		"status", string(result.Status),
+		// `status` is the delivery result reported by the worker.
+		"delivery_result", string(result.Status),
+		"error_code", result.ErrorCode,
+		"error_message", logging.StrDeref(result.ErrorMessage),
+		"user_not_found_by_phone", result.Status == domain.TaskStatusUserNotFoundByPhone,
+		"reply_received", result.ReplyText != nil,
+	)
+	// Elapsed time is only meaningful when the worker stamped the result.
+	if !result.Timestamp.IsZero() {
+		ageMS := time.Since(result.Timestamp).Milliseconds()
+		if ageMS < 0 {
+			ageMS = 0
+		}
+		trace["worker_timestamp"] = result.Timestamp.UTC().Format(time.RFC3339Nano)
+		trace["result_age_ms"] = ageMS
+	}
+	return trace
+}
 
 type BlocklistUpdater interface {
 	Add(tenantID uuid.UUID, phoneNormalized string)
@@ -74,6 +112,9 @@ func (rc *ResultConsumer) reconnect() error {
 
 	ch, err := rc.amqpConn.Channel()
 	if err != nil {
+		logging.Error("RABBITMQ_CHANNEL_OPEN_FAILED", logging.Fields(
+			"component", "result_consumer", "queue", rc.queueName, "error", err.Error(),
+		))
 		return err
 	}
 
@@ -86,11 +127,17 @@ func (rc *ResultConsumer) reconnect() error {
 		nil,
 	)
 	if err != nil {
+		logging.Error("RABBITMQ_QUEUE_DECLARE_FAILED", logging.Fields(
+			"component", "result_consumer", "queue", rc.queueName, "error", err.Error(),
+		))
 		return err
 	}
 
 	rc.amqpChan = ch
 	log.Println("ResultConsumer: reconnected to RabbitMQ channel")
+	logging.Info("RABBITMQ_RECONNECTED", logging.Fields(
+		"component", "result_consumer", "queue", rc.queueName,
+	))
 	return nil
 }
 
@@ -115,6 +162,9 @@ func (rc *ResultConsumer) Run(ctx context.Context) error {
 
 	ch, err := rc.amqpConn.Channel()
 	if err != nil {
+		logging.Error("RABBITMQ_CHANNEL_OPEN_FAILED", logging.Fields(
+			"component", "result_consumer", "queue", rc.queueName, "error", err.Error(),
+		))
 		return err
 	}
 	defer ch.Close()
@@ -128,6 +178,9 @@ func (rc *ResultConsumer) Run(ctx context.Context) error {
 		nil,
 	)
 	if err != nil {
+		logging.Error("RABBITMQ_QUEUE_DECLARE_FAILED", logging.Fields(
+			"component", "result_consumer", "queue", rc.queueName, "error", err.Error(),
+		))
 		return err
 	}
 
@@ -141,10 +194,16 @@ func (rc *ResultConsumer) Run(ctx context.Context) error {
 		nil,
 	)
 	if err != nil {
+		logging.Error("RABBITMQ_CONSUME_FAILED", logging.Fields(
+			"component", "result_consumer", "queue", rc.queueName, "consumer_tag", "result-consumer", "error", err.Error(),
+		))
 		return err
 	}
 
 	log.Println("ResultConsumer: started consuming messages")
+	logging.Info("RABBITMQ_CONSUMER_STARTED", logging.Fields(
+		"component", "result_consumer", "queue", rc.queueName, "consumer_tag", "result-consumer",
+	))
 
 	for {
 		select {
@@ -229,6 +288,12 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 
 	for _, item := range toProcess {
 		result := item.result
+		// Diagnostic: a worker result arrived at the orchestrator. Emitted
+		// before chat_id mapping resolution so it reflects exactly what the
+		// worker sent; resolved identifiers follow in TARGET_STATUS_UPDATE_*.
+		trace := resultTrace(&result)
+		logging.Info("WORKER_RESULT_RECEIVED", trace)
+
 		processCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 
 		log.Printf("ResultConsumer: processing result for target %s, status: %s, reply: %v", result.TargetID, result.Status, result.ReplyText)
@@ -259,8 +324,13 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				if err != nil {
 					if errors.Is(err, pgx.ErrNoRows) {
 						log.Printf("ResultConsumer: chat_id mapping not found (skipping): chat_id=%s status=%s", result.ChatID, result.Status)
+						logging.Warn("WORKER_RESULT_REJECTED", logging.WithFields(trace,
+							"reason", "chat_id_mapping_not_found"))
 					} else {
 						log.Printf("ResultConsumer: failed to resolve chat_id mapping (skipping): chat_id=%s err=%v", result.ChatID, err)
+						logging.Warn("WORKER_RESULT_REJECTED", logging.WithFields(trace,
+							"reason", "chat_id_mapping_lookup_failed",
+							"error", err.Error()))
 					}
 					cancel()
 					_ = item.msg.Ack(false)
@@ -274,6 +344,9 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				}
 				if mapping.CampaignTargetID == uuid.Nil {
 					log.Printf("ResultConsumer: chat_id=%s maps to admin/non-campaign row (skipping status=%s)", result.ChatID, result.Status)
+					logging.Info("WORKER_RESULT_REJECTED", logging.WithFields(trace,
+						"reason", "admin_or_non_campaign_row",
+						"resolved_campaign_id", result.CampaignID.String()))
 					cancel()
 					_ = item.msg.Ack(false)
 					continue
@@ -282,6 +355,10 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 		}
 
 		if result.Status == domain.TaskStatusSent && result.TenantID != uuid.Nil && result.TargetID == uuid.Nil && result.CampaignID == uuid.Nil {
+			// Admin-notification send result: recorded as a chat mapping above,
+			// there is no campaign target to transition.
+			logging.Info("WORKER_RESULT_REJECTED", logging.WithFields(trace,
+				"reason", "admin_notification_result"))
 			cancel()
 			if err := item.msg.Ack(false); err != nil {
 				log.Printf("ResultConsumer: failed to ack message: %v", err)
@@ -295,6 +372,8 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 			} else {
 				log.Printf("ResultConsumer: unresolved mapping (skipping): target=%s campaign=%s status=%s", result.TargetID, result.CampaignID, result.Status)
 			}
+			logging.Warn("WORKER_RESULT_REJECTED", logging.WithFields(trace,
+				"reason", "unresolved_target_mapping"))
 			cancel()
 			_ = item.msg.Ack(false)
 			continue
@@ -310,6 +389,8 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 						}
 						if d <= 2*time.Minute {
 							log.Printf("ResultConsumer: duplicate reply detected (skipping): target=%s chat_id=%s", result.TargetID, result.ChatID)
+							logging.Info("WORKER_RESULT_REJECTED", logging.WithFields(trace,
+								"reason", "duplicate_reply"))
 							cancel()
 							if err := item.msg.Ack(false); err != nil {
 								log.Printf("ResultConsumer: failed to ack message: %v", err)
@@ -477,6 +558,22 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				}
 			}
 
+			// --- Diagnostic: tenant admin notification publish (logging only) ---
+			// The notification is a separate worker task (queue
+			// tasks.messages.tenant_admin_notify), so it is traced separately
+			// from the campaign send tasks.
+			notifyTrace := logging.Fields(
+				"tenant_id", tenantID.String(),
+				"phone", logging.MaskPhone(adminPhone),
+				"messenger_type", string(domain.DefaultMessengerType),
+				"chat_id", adminChatID,
+				"use_chat_id", adminUseChatID,
+				"reply_count", len(replies),
+				"queue", "tasks.messages.tenant_admin_notify",
+			)
+			logging.Info("ADMIN_NOTIFY_PUBLISH_START", notifyTrace)
+			notifyStartedAt := time.Now()
+
 			err = rc.amqpChan.PublishWithContext(
 				publishCtx,
 				"",                                   // exchange
@@ -505,14 +602,27 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 					)
 					if err != nil {
 						log.Printf("ResultConsumer: still failed to publish notification for tenant %s phone %s: %v", tenantID, adminPhone, err)
+						logging.Error("ADMIN_NOTIFY_PUBLISH_FAILED", logging.WithFields(notifyTrace,
+							"error", err.Error(),
+							"retried_after_reconnect", true,
+							"publish_duration_ms", time.Since(notifyStartedAt).Milliseconds()))
 					} else {
 						log.Printf("ResultConsumer: published notification to tenant %s phone %s (%d replies, chat_id=%s, use_chat_id=%v)", tenantID, adminPhone, len(replies), adminChatID, adminUseChatID)
+						logging.Info("ADMIN_NOTIFY_PUBLISHED", logging.WithFields(notifyTrace,
+							"retried_after_reconnect", true,
+							"publish_duration_ms", time.Since(notifyStartedAt).Milliseconds()))
 					}
 				} else {
 					log.Printf("ResultConsumer: failed to reconnect for tenant %s phone %s: %v", tenantID, adminPhone, err)
+					logging.Error("ADMIN_NOTIFY_PUBLISH_FAILED", logging.WithFields(notifyTrace,
+						"error", err.Error(),
+						"reconnect_failed", true,
+						"publish_duration_ms", time.Since(notifyStartedAt).Milliseconds()))
 				}
 			} else {
 				log.Printf("ResultConsumer: published notification to tenant %s phone %s (%d replies, chat_id=%s, use_chat_id=%v)", tenantID, adminPhone, len(replies), adminChatID, adminUseChatID)
+				logging.Info("ADMIN_NOTIFY_PUBLISHED", logging.WithFields(notifyTrace,
+					"publish_duration_ms", time.Since(notifyStartedAt).Milliseconds()))
 			}
 		}
 	}

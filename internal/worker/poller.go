@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/logging"
 	"github.com/rabbitmq/amqp091-go"
 )
 
@@ -49,6 +50,9 @@ func (p *ReplyPoller) reconnect() error {
 	// Create new channel
 	ch, err := p.amqpConn.Channel()
 	if err != nil {
+		logging.Error("RABBITMQ_CHANNEL_OPEN_FAILED", logging.Fields(
+			"component", "reply_poller", "queue", p.queueName, "error", err.Error(),
+		))
 		return err
 	}
 
@@ -62,11 +66,17 @@ func (p *ReplyPoller) reconnect() error {
 		nil,
 	)
 	if err != nil {
+		logging.Error("RABBITMQ_QUEUE_DECLARE_FAILED", logging.Fields(
+			"component", "reply_poller", "queue", p.queueName, "error", err.Error(),
+		))
 		return err
 	}
 
 	p.amqpChan = ch
 	log.Println("ReplyPoller: Reconnected to RabbitMQ channel")
+	logging.Info("RABBITMQ_RECONNECTED", logging.Fields(
+		"component", "reply_poller", "queue", p.queueName,
+	))
 	return nil
 }
 
@@ -212,8 +222,25 @@ func (p *ReplyPoller) PollActiveCampaigns(_ context.Context) {
 			}
 			if err != nil {
 				log.Printf("ReplyPoller: failed to publish poll chunk %d for campaign %s: %v", i+1, c.ID, err)
+				logging.Error("POLL_TASK_PUBLISH_FAILED", logging.Fields(
+					"campaign_id", c.ID.String(),
+					"tenant_id", c.TenantID.String(),
+					"chunk_index", i+1,
+					"chunk_total", len(chunks),
+					"target_count", len(chunk),
+					"queue", p.queueName,
+					"error", err.Error(),
+				))
 			} else {
 				log.Printf("ReplyPoller: published poll chunk %d for campaign %s with %d targets", i+1, c.ID, len(chunk))
+				logging.Info("POLL_TASK_PUBLISHED", logging.Fields(
+					"campaign_id", c.ID.String(),
+					"tenant_id", c.TenantID.String(),
+					"chunk_index", i+1,
+					"chunk_total", len(chunks),
+					"target_count", len(chunk),
+					"queue", p.queueName,
+				))
 			}
 		}
 	}

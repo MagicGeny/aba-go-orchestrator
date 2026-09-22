@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/logging"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -263,15 +264,42 @@ func (r *PostgresRepository) UpdateTargetStatus(ctx context.Context, targetID uu
 	now := time.Now().UTC()
 	err = tx.QueryRow(ctx, "SELECT campaign_id, status FROM campaign_targets WHERE id = $1 FOR UPDATE", targetID).Scan(&campaignID, &oldStatus)
 	if err != nil {
+		logging.Error("TARGET_STATUS_UPDATE_FAILED", logging.Fields(
+			"target_id", targetID.String(),
+			"task_id", targetID.String(),
+			"new_status", string(status),
+			"error", err.Error(),
+		))
 		return nil, err
 	}
 	statusToWrite := status
 	if !status.IsErrorStatus() && oldStatus.Rank() > status.Rank() {
 		statusToWrite = oldStatus
 	}
+	// Diagnostic: DB status transition. Emitted here (rather than in the
+	// result consumer / callback handler) because old_status is read inside
+	// this transaction, so no extra query is needed to report it. Zero rows
+	// changed => the callers' behaviour is untouched.
+	logging.Info("TARGET_STATUS_UPDATE_START", logging.Fields(
+		"target_id", targetID.String(),
+		"task_id", targetID.String(),
+		"campaign_id", campaignID.String(),
+		"old_status", string(oldStatus),
+		"new_status", string(status),
+		"effective_status", string(statusToWrite),
+		"transition_suppressed", statusToWrite != status,
+	))
 	_, err = tx.Exec(ctx, "UPDATE campaign_targets SET status = $1, last_error = $2, sent_at = COALESCE($3, sent_at), updated_at = $4 WHERE id = $5",
 		statusToWrite, lastError, finalSentAt, now, targetID)
 	if err != nil {
+		logging.Error("TARGET_STATUS_UPDATE_FAILED", logging.Fields(
+			"target_id", targetID.String(),
+			"task_id", targetID.String(),
+			"campaign_id", campaignID.String(),
+			"old_status", string(oldStatus),
+			"new_status", string(status),
+			"error", err.Error(),
+		))
 		return nil, err
 	}
 
@@ -294,10 +322,38 @@ func (r *PostgresRepository) UpdateTargetStatus(ctx context.Context, targetID uu
 	err = tx.QueryRow(ctx, query, args...).Scan(
 		&c.ID, &c.TenantID, &c.Name, &c.MessageTemplate, &c.Status, &c.OriginalExcelName, &c.ProcessedCount, &c.TotalCount, &c.ErrorCount, &c.CreatedAt, &c.UpdatedAt, &c.OriginalExcelPath, &c.ProcessedExcelPath, &c.AttachmentURL, &c.AttachmentName, &c.Deleted, &c.StartImmediately, &c.TimeToStart)
 	if err != nil {
+		logging.Error("TARGET_STATUS_UPDATE_FAILED", logging.Fields(
+			"target_id", targetID.String(),
+			"task_id", targetID.String(),
+			"campaign_id", campaignID.String(),
+			"old_status", string(oldStatus),
+			"new_status", string(status),
+			"error", err.Error(),
+		))
 		return nil, err
 	}
 
-	return &c, tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		logging.Error("TARGET_STATUS_UPDATE_FAILED", logging.Fields(
+			"target_id", targetID.String(),
+			"task_id", targetID.String(),
+			"campaign_id", campaignID.String(),
+			"old_status", string(oldStatus),
+			"new_status", string(status),
+			"error", err.Error(),
+		))
+		return nil, err
+	}
+	logging.Info("TARGET_STATUS_UPDATED", logging.Fields(
+		"target_id", targetID.String(),
+		"task_id", targetID.String(),
+		"campaign_id", campaignID.String(),
+		"old_status", string(oldStatus),
+		"new_status", string(status),
+		"effective_status", string(statusToWrite),
+		"campaign_status", string(c.Status),
+	))
+	return &c, nil
 }
 
 func (r *PostgresRepository) UpdateCampaign(ctx context.Context, campaign *domain.Campaign) error {

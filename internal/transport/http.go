@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/logging"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/usecase"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/worker"
 	"github.com/google/uuid"
@@ -177,6 +178,12 @@ func (h *HTTPHandler) StopCampaign(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *HTTPHandler) WorkerCallback(w http.ResponseWriter, r *http.Request) {
+	// request_id correlates the RECEIVED/PROCESSED/REJECTED lines of this one
+	// HTTP call: a task can be retried/called back more than once, so task_id
+	// alone is not unique per request.
+	requestID := uuid.NewString()
+	remoteAddr := r.RemoteAddr
+
 	var payload struct {
 		TaskID       uuid.UUID `json:"task_id"`
 		Status       string    `json:"status"`
@@ -187,6 +194,12 @@ func (h *HTTPHandler) WorkerCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		logging.Warn("WORKER_CALLBACK_REJECTED", logging.Fields(
+			"request_id", requestID,
+			"remote_addr", remoteAddr,
+			"reason", "invalid_json",
+			"error", err.Error(),
+		))
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -199,6 +212,23 @@ func (h *HTTPHandler) WorkerCallback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// --- Diagnostic: worker callback entered the orchestrator (logging only) ---
+	// The worker callback contract carries the campaign target id as task_id,
+	// so target_id == task_id here. tenant_id / messenger_type are not part of
+	// the callback contract; the DB transition logs them where known.
+	callbackTrace := logging.Fields(
+		"request_id", requestID,
+		"remote_addr", remoteAddr,
+		"task_id", payload.TaskID.String(),
+		"target_id", payload.TaskID.String(),
+		"tenant_account_id", payload.AccountID,
+		"status", payload.Status,
+		"error_code", payload.ErrorCode,
+		"error_message", payload.ErrorMessage,
+		"sent_at", payload.SentAt,
+	)
+	logging.Info("WORKER_CALLBACK_RECEIVED", callbackTrace)
+
 	// Create independent context
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -206,9 +236,20 @@ func (h *HTTPHandler) WorkerCallback(w http.ResponseWriter, r *http.Request) {
 	campaign, err := h.campaignUC.UpdateTargetStatusWithCode(ctx, payload.TaskID, domain.TaskStatus(payload.Status), payload.ErrorCode, payload.ErrorMessage, sentAt)
 	if err != nil {
 		log.Printf("UpdateTargetStatus error: %v", err)
+		logging.Error("WORKER_CALLBACK_REJECTED", logging.WithFields(callbackTrace,
+			"reason", "status_update_failed",
+			"error", err.Error()))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	logging.Info("WORKER_CALLBACK_PROCESSED", logging.WithFields(callbackTrace,
+		"campaign_id", campaign.ID.String(),
+		"campaign_status", string(campaign.Status),
+		"processed_count", campaign.ProcessedCount,
+		"total_count", campaign.TotalCount,
+		"error_count", campaign.ErrorCount,
+	))
 
 	// Broadcast update via WS
 	h.hub.BroadcastStatus(campaign.ID, map[string]any{

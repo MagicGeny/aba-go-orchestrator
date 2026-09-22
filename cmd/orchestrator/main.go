@@ -23,6 +23,7 @@ import (
 
 	"github.com/MagicGeny/aba-go-orchestrator/internal/blocklist"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/config"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/logging"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/repository"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/storage"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/transport"
@@ -37,6 +38,18 @@ func main() {
 	if exe, err := os.Executable(); err == nil {
 		_ = godotenv.Load(filepath.Join(filepath.Dir(exe), ".env"))
 	}
+
+	// 0. Initialise file logging.
+	// Re-points the standard logger to stderr + a rotating JSON-lines file so
+	// every existing log.Printf/Println/Fatalf call is persisted as well.
+	// This is diagnostics only: if the file cannot be opened we keep running
+	// with console logging and report the reason.
+	if err := logging.Init(); err != nil {
+		log.Printf("logging: file logging disabled: %v", err)
+	} else {
+		defer logging.Close()
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -62,9 +75,17 @@ func main() {
 	}
 	amqpConn, err := amqp091.Dial(amqpURL)
 	if err != nil {
+		logging.Error("RABBITMQ_CONNECT_FAILED", logging.Fields(
+			"url", logging.RedactURL(amqpURL),
+			"error", err.Error(),
+		))
 		log.Fatalf("unable to connect to rabbitmq: %v", err)
 	}
 	defer amqpConn.Close()
+	logging.Info("RABBITMQ_CONNECTED", logging.Fields("url", logging.RedactURL(amqpURL)))
+	// Observational only: report broker-side connection loss. No reconnect or
+	// other behaviour is added here.
+	go watchRabbitMQConnection(amqpConn)
 
 	// 3. Initialize layers
 	repo := repository.NewPostgresRepository(pool)
@@ -246,6 +267,25 @@ func warnMissingTenantBaseline(ctx context.Context, pool *pgxpool.Pool) {
 	}
 	if count == 0 {
 		log.Printf("startup: tenants table is empty — campaigns and admin notifications cannot run")
+	}
+}
+
+// watchRabbitMQConnection reports broker-side connection loss to the log file.
+// It is purely observational — it neither reconnects nor alters any behaviour.
+// amqp091 closes the notify channel after delivering the shutdown error, so
+// the range terminates by itself.
+func watchRabbitMQConnection(conn *amqp091.Connection) {
+	closed := conn.NotifyClose(make(chan *amqp091.Error, 4))
+	for amqpErr := range closed {
+		if amqpErr == nil {
+			logging.Warn("RABBITMQ_CONNECTION_CLOSED", nil)
+			continue
+		}
+		logging.Error("RABBITMQ_CONNECTION_CLOSED", logging.Fields(
+			"code", amqpErr.Code,
+			"reason", amqpErr.Reason,
+			"error", amqpErr.Error(),
+		))
 	}
 }
 
