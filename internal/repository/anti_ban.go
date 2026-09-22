@@ -120,7 +120,11 @@ func (r *PostgresRepository) GetNextPendingColdTarget(ctx context.Context, tenan
 func (r *PostgresRepository) getNextPendingTarget(ctx context.Context, tenantID uuid.UUID, warm bool) (*domain.PendingTargetForDosing, error) {
 	// Warm = pending/retry_pending target that already has a chat_id mapping (repeat contact).
 	// Cold = pending/retry_pending target with no mapping.
-	// Only a *pending* outbox row blocks re-dosing so processed outbox history is preserved on retry.
+	`` // Eligibility is driven by the target's own status/attempt_count, not by outbox_messages.status.
+	// A pending target with attempt_count > 0 already has an in-flight outbox and is NOT re-selected
+	// until the worker returns a terminal or retryable result.  This prevents the duplicate-dosing
+	// race that occurred when only a pending outbox row blocked re-selection (the row becomes
+	// 'processed' once RabbitMQ publishes, before the worker returns).
 	mappingClause := `
 		AND EXISTS (
 			SELECT 1 FROM chat_phone_mappings m
@@ -168,17 +172,12 @@ func (r *PostgresRepository) getNextPendingTarget(ctx context.Context, tenantID 
 		  AND c.status = 'processing'
 		  AND c.deleted = FALSE
 		  AND (
-		        ct.status = 'pending'
+		        (ct.status = 'pending' AND COALESCE(ct.attempt_count, 0) = 0)
 		     OR (ct.status = 'retry_pending' AND (ct.next_attempt_at IS NULL OR ct.next_attempt_at <= NOW()))
 		  )
 		  AND NOT EXISTS (
 			SELECT 1 FROM tenant_blocked_recipients b
 			WHERE b.tenant_id = c.tenant_id AND b.phone_normalized = ct.phone_normalized
-		  )
-		  AND NOT EXISTS (
-			SELECT 1 FROM outbox_messages o
-			WHERE o.payload->>'task_id' = ct.id::text
-			  AND o.status = 'pending'
 		  )
 		` + mappingClause + `
 		ORDER BY ct.created_at ASC
@@ -225,12 +224,30 @@ func (r *PostgresRepository) CreateDosedOutboxMessage(ctx context.Context, tenan
 	return err
 }
 
-func (r *PostgresRepository) AssignAccountAndEnqueueTarget(ctx context.Context, targetID, tenantID, accountID uuid.UUID, eventType string, payload []byte, publishAt time.Time) error {
+func (r *PostgresRepository) AssignAccountAndEnqueueTarget(ctx context.Context, targetID, tenantID, accountID uuid.UUID, eventType string, payload []byte, publishAt time.Time) (bool, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback(ctx)
+
+	// Atomically lock the target row and verify it is still eligible for a new attempt.
+	var attemptCount int
+	err = tx.QueryRow(ctx, `
+		SELECT COALESCE(attempt_count, 0)
+		FROM campaign_targets
+		WHERE id = $1
+		  AND (
+		        (status = 'pending' AND COALESCE(attempt_count, 0) = 0)
+		     OR (status = 'retry_pending' AND (next_attempt_at IS NULL OR next_attempt_at <= NOW()))
+		  )
+		FOR UPDATE`, targetID).Scan(&attemptCount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("load target for claim: %w", err)
+	}
 
 	usageDate := publishAt.UTC().Format("2006-01-02")
 	tag, err := tx.Exec(ctx, `
@@ -243,10 +260,10 @@ func (r *PostgresRepository) AssignAccountAndEnqueueTarget(ctx context.Context, 
 			SELECT daily_limit FROM tenant_accounts WHERE id = $1
 		)`, accountID, usageDate)
 	if err != nil {
-		return fmt.Errorf("reserve account daily slot: %w", err)
+		return false, fmt.Errorf("reserve account daily slot: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("account daily limit exhausted: %s", accountID)
+		return false, fmt.Errorf("account daily limit exhausted: %s", accountID)
 	}
 
 	_, err = tx.Exec(ctx, `
@@ -259,7 +276,7 @@ func (r *PostgresRepository) AssignAccountAndEnqueueTarget(ctx context.Context, 
 		    updated_at = NOW()
 		WHERE id = $3`, accountID, tenantID, targetID)
 	if err != nil {
-		return fmt.Errorf("assign account to target: %w", err)
+		return false, fmt.Errorf("assign account to target: %w", err)
 	}
 
 	outboxID, err := uuid.NewV7()
@@ -271,9 +288,9 @@ func (r *PostgresRepository) AssignAccountAndEnqueueTarget(ctx context.Context, 
 		VALUES ($1, $2, $3, 'pending', $4, $5, $6)`,
 		outboxID, eventType, payload, publishAt, tenantID, accountID)
 	if err != nil {
-		return fmt.Errorf("insert dosed outbox: %w", err)
+		return false, fmt.Errorf("insert dosed outbox: %w", err)
 	}
-	return tx.Commit(ctx)
+	return true, tx.Commit(ctx)
 }
 
 func (r *PostgresRepository) ListAssignableTenantAccounts(ctx context.Context, tenantID uuid.UUID, quotaDate time.Time, now time.Time) ([]*domain.TenantAccount, error) {

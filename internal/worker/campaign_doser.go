@@ -221,7 +221,8 @@ func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.Pendi
 		if !reserved {
 			return nil
 		}
-		if err := d.repo.AssignAccountAndEnqueueTarget(ctx, target.TargetID, target.TenantID, account.ID, eventType, payload, at); err != nil {
+		dosed, err := d.repo.AssignAccountAndEnqueueTarget(ctx, target.TargetID, target.TenantID, account.ID, eventType, payload, at)
+		if err != nil {
 			log.Printf("CampaignDoser: enqueue failed target=%s tenant_account_id=%s key=%s: %v", target.TargetID, account.ID, account.AccountKey, err)
 			logging.Error("TARGET_DOSE_FAILED", logging.WithFields(
 				doseTrace(target, account, messengerType, contactType, eventType, useChatID, at),
@@ -231,11 +232,15 @@ func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.Pendi
 		}
 		log.Printf("CampaignDoser: cold target=%s tenant_account_id=%s key=%s", target.TargetID, account.ID, account.AccountKey)
 		logging.Info("TARGET_DOSED", doseTrace(target, account, messengerType, contactType, eventType, useChatID, at))
+		if dosed {
+			log.Printf("CampaignDoser: cold target=%s tenant_account_id=%s key=%s", target.TargetID, account.ID, account.AccountKey)
+		}
 		return nil
 	}
 
 	warmPublishAt := at.Add(interval)
-	if err := d.repo.AssignAccountAndEnqueueTarget(ctx, target.TargetID, target.TenantID, account.ID, eventType, payload, warmPublishAt); err != nil {
+	dosed, err := d.repo.AssignAccountAndEnqueueTarget(ctx, target.TargetID, target.TenantID, account.ID, eventType, payload, warmPublishAt)
+	if err != nil {
 		log.Printf("CampaignDoser: warm enqueue failed target=%s tenant_account_id=%s key=%s: %v", target.TargetID, account.ID, account.AccountKey, err)
 		logging.Error("TARGET_DOSE_FAILED", logging.WithFields(
 			doseTrace(target, account, messengerType, contactType, eventType, useChatID, warmPublishAt),
@@ -246,4 +251,9 @@ func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.Pendi
 	log.Printf("CampaignDoser: warm target=%s tenant_account_id=%s key=%s", target.TargetID, account.ID, account.AccountKey)
 	logging.Info("TARGET_DOSED", doseTrace(target, account, messengerType, contactType, eventType, useChatID, warmPublishAt))
 	return d.repo.IncrementWarmUsed(ctx, target.TenantID, quotaDate)
+	if dosed {
+		log.Printf("CampaignDoser: warm target=%s tenant_account_id=%s key=%s", target.TargetID, account.ID, account.AccountKey)
+		return d.repo.IncrementWarmUsed(ctx, target.TenantID, quotaDate)
+	}
+	return nil
 }

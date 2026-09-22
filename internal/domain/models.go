@@ -405,7 +405,9 @@ type CampaignRepository interface {
 	CreateDosedOutboxMessage(ctx context.Context, tenantID uuid.UUID, eventType string, payload []byte, publishAt time.Time) error
 	// AssignAccountAndEnqueueTarget persists the selected account on the target,
 	// increments account daily usage, and inserts a new outbox row (never deletes old ones).
-	AssignAccountAndEnqueueTarget(ctx context.Context, targetID, tenantID, accountID uuid.UUID, eventType string, payload []byte, publishAt time.Time) error
+	// Returns (true, nil) when a new attempt is created; (false, nil) when the target
+	// is no longer eligible (already in-flight or terminal — no outbox or slot consumed).
+	AssignAccountAndEnqueueTarget(ctx context.Context, targetID, tenantID, accountID uuid.UUID, eventType string, payload []byte, publishAt time.Time) (dosed bool, err error)
 	ListAssignableTenantAccounts(ctx context.Context, tenantID uuid.UUID, quotaDate time.Time, now time.Time) ([]*TenantAccount, error)
 	GetTenantAccountByID(ctx context.Context, accountID uuid.UUID) (*TenantAccount, error)
 	GetTenantAccountByKey(ctx context.Context, tenantID uuid.UUID, accountKey string) (*TenantAccount, error)
