@@ -120,7 +120,7 @@ func (r *PostgresRepository) GetNextPendingColdTarget(ctx context.Context, tenan
 func (r *PostgresRepository) getNextPendingTarget(ctx context.Context, tenantID uuid.UUID, warm bool) (*domain.PendingTargetForDosing, error) {
 	// Warm = pending/retry_pending target that already has a chat_id mapping (repeat contact).
 	// Cold = pending/retry_pending target with no mapping.
-	`` // Eligibility is driven by the target's own status/attempt_count, not by outbox_messages.status.
+	// Eligibility is driven by the target's own status/attempt_count, not by outbox_messages.status.
 	// A pending target with attempt_count > 0 already has an in-flight outbox and is NOT re-selected
 	// until the worker returns a terminal or retryable result.  This prevents the duplicate-dosing
 	// race that occurred when only a pending outbox row blocked re-selection (the row becomes
