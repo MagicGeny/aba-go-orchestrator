@@ -1,2 +1,4 @@
 /vendor/
 /orchestrator
+.env
+/logs/
