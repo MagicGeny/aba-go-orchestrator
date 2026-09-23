@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"math/rand/v2"
 	"strings"
@@ -23,6 +24,61 @@ const (
 	batchSize     = 1
 	flushInterval = 55 * time.Second
 )
+
+// notifyGroupKey identifies one tenant-admin notification group. Replies are
+// grouped by BOTH the tenant and the sender account (tenant_accounts.id): MAX
+// chats belong to one account, so grouping by tenant alone would let account B
+// send (and persist a chat mapping for) account A's replies.
+type notifyGroupKey struct {
+	TenantID        uuid.UUID
+	TenantAccountID uuid.UUID
+}
+
+// observedReply is a reply together with its account provenance.
+type observedReply struct {
+	TenantID        uuid.UUID
+	TenantAccountID uuid.UUID
+	Reply           domain.ClientReplyInfo
+}
+
+// groupRepliesByTenantAccount groups replies by (tenant_id, tenant_account_id).
+func groupRepliesByTenantAccount(observed []observedReply) map[notifyGroupKey][]domain.ClientReplyInfo {
+	groups := make(map[notifyGroupKey][]domain.ClientReplyInfo)
+	for _, item := range observed {
+		key := notifyGroupKey{TenantID: item.TenantID, TenantAccountID: item.TenantAccountID}
+		groups[key] = append(groups[key], item.Reply)
+	}
+	return groups
+}
+
+// replyAccountID resolves which sender account observed a reply. The worker
+// reports tenant_account_id for its own events; polled replies are attributed to
+// the account assigned to the campaign target when it was dosed. uuid.Nil means
+// the account is unknown: such a reply must not produce an account-ambiguous
+// admin notification.
+func replyAccountID(resultTenantAccountID uuid.UUID, target *domain.CampaignTarget) uuid.UUID {
+	if resultTenantAccountID != uuid.Nil {
+		return resultTenantAccountID
+	}
+	if target != nil && target.TenantAccountID != nil {
+		return *target.TenantAccountID
+	}
+	return uuid.Nil
+}
+
+// resultAccountID resolves the sender account reported in a worker result.
+// tenant_account_id is the authoritative field; account_id is the legacy one.
+func resultAccountID(result domain.TargetResult) uuid.UUID {
+	if result.TenantAccountID != uuid.Nil {
+		return result.TenantAccountID
+	}
+	if id := strings.TrimSpace(result.AccountID); id != "" {
+		if parsed, err := uuid.Parse(id); err == nil {
+			return parsed
+		}
+	}
+	return uuid.Nil
+}
 
 // resultTrace builds the correlation identifier set used by the worker-result
 // diagnostics. It mirrors the identifiers used when the task was published
@@ -283,8 +339,9 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 
 	log.Printf("ResultConsumer: processing batch of %d results", len(toProcess))
 
-	// Track replies grouped by tenant
-	tenantReplies := make(map[uuid.UUID][]domain.ClientReplyInfo)
+	// Track replies together with their account provenance; they are grouped by
+	// (tenant_id, tenant_account_id) once the batch has been processed.
+	var observedReplies []observedReply
 
 	for _, item := range toProcess {
 		result := item.result
@@ -312,11 +369,36 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 					log.Printf("ResultConsumer: failed to upsert chat mapping for target %s chat_id=%s: %v", result.TargetID, result.ChatID, err)
 				}
 			} else if result.Status == domain.TaskStatusSent && result.TenantID != uuid.Nil && strings.TrimSpace(result.PhoneNumber) != "" {
-				// Admin notification: TargetID/CampaignID is empty, but we know the tenant_id and phone number.
-				// Save the chat_id so that future notifications will be sent directly to the chat_id.
-				if err := rc.repo.UpsertAdminChatMapping(processCtx, result.ChatID, result.TenantID, result.PhoneNumber, result.MessengerType); err != nil {
-					log.Printf("ResultConsumer: failed to upsert admin chat mapping for chat_id=%s phone=%s: %v", result.ChatID, result.PhoneNumber, err)
+				// Admin notification result: TargetID/CampaignID are empty, but we know
+				// the tenant, the phone number and (reported by the worker) the sender
+				// account. Persist the chat_id in admin_chat_phone_mappings — a table
+				// separate from campaign/customer chat_phone_mappings — against the
+				// account that actually sent it.
+				adminAccountID := resultAccountID(result)
+				if adminAccountID == uuid.Nil {
+					// Without the sender account the mapping would be ambiguous: never
+					// guess an account for an admin chat.
+					log.Printf("ResultConsumer: admin chat mapping not saved (sender account unknown): tenant=%s phone=%s chat_id=%s", result.TenantID, result.PhoneNumber, result.ChatID)
+					logging.Error("ADMIN_MAPPING_ACCOUNT_UNKNOWN", logging.WithFields(trace,
+						"reason", "tenant_account_id_unknown",
+						"chat_id", result.ChatID))
+				} else if err := rc.repo.UpsertAdminChatMapping(processCtx, result.ChatID, result.TenantID, adminAccountID, result.PhoneNumber, result.MessengerType); err != nil {
+					log.Printf("ResultConsumer: failed to upsert admin chat mapping for chat_id=%s phone=%s tenant_account_id=%s: %v", result.ChatID, result.PhoneNumber, adminAccountID, err)
+					logging.Error("ADMIN_MAPPING_SAVE_FAILED", logging.WithFields(trace,
+						"error", err.Error(),
+						"chat_id", result.ChatID))
+				} else {
+					log.Printf("ResultConsumer: admin chat mapping saved: chat_id=%s tenant=%s tenant_account_id=%s phone=%s", result.ChatID, result.TenantID, adminAccountID, result.PhoneNumber)
+					logging.Info("ADMIN_MAPPING_SAVED", logging.WithFields(trace,
+						"chat_id", result.ChatID))
 				}
+				// Admin chats are never resolved through chat_phone_mappings and there
+				// is no campaign target to transition: the result is fully handled here.
+				cancel()
+				if err := item.msg.Ack(false); err != nil {
+					log.Printf("ResultConsumer: failed to ack message: %v", err)
+				}
+				continue
 			}
 
 			if result.TargetID == uuid.Nil || result.CampaignID == uuid.Nil || strings.TrimSpace(result.PhoneNumber) == "" {
@@ -421,12 +503,17 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				rc.blocklist.Add(campaign.TenantID, target.PhoneNormalized)
 			}
 
-			// Add to tenantReplies
-			tenantReplies[campaign.TenantID] = append(tenantReplies[campaign.TenantID], domain.ClientReplyInfo{
-				UserPhone: target.PhoneNormalized,
-				UserName:  target.ClientName,
-				Message:   *result.ReplyText,
-				Time:      result.Timestamp,
+			// Preserve the sender-account provenance of the reply: only the account
+			// that observed it may generate (and send) the notification.
+			observedReplies = append(observedReplies, observedReply{
+				TenantID:        campaign.TenantID,
+				TenantAccountID: replyAccountID(result.TenantAccountID, target),
+				Reply: domain.ClientReplyInfo{
+					UserPhone: target.PhoneNormalized,
+					UserName:  target.ClientName,
+					Message:   *result.ReplyText,
+					Time:      result.Timestamp,
+				},
 			})
 		} else if result.Status == domain.TaskStatusViewed {
 			// Handle "viewed" status - update target status and record viewed time
@@ -473,9 +560,28 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 		}
 	}
 
+	// Group replies by (tenant_id, tenant_account_id): every account produces its
+	// own admin notification, published to its own account-specific queue.
+	tenantReplies := groupRepliesByTenantAccount(observedReplies)
+
 	// Now, send tenant admin notifications
-	for tenantID, replies := range tenantReplies {
+	for group, replies := range tenantReplies {
 		if len(replies) == 0 {
+			continue
+		}
+
+		tenantID := group.TenantID
+		tenantAccountID := group.TenantAccountID
+		if tenantAccountID == uuid.Nil {
+			// Never send an account-ambiguous admin notification: without the sender
+			// account it cannot be routed, and the resulting chat mapping could not
+			// be scoped to an account.
+			log.Printf("ResultConsumer: skipping admin notification for tenant %s (%d replies): sender account unknown", tenantID, len(replies))
+			logging.Warn("ADMIN_NOTIFY_SKIPPED", logging.Fields(
+				"tenant_id", tenantID.String(),
+				"reason", "tenant_account_id_unknown",
+				"reply_count", len(replies),
+			))
 			continue
 		}
 
@@ -510,22 +616,26 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 			var adminUseChatID bool
 			if adminNormalized != "" {
 				mt := string(domain.DefaultMessengerType)
-				if mapping, err := rc.repo.GetChatPhoneMappingByPhone(tenantCtx, tenantID, adminNormalized, mt); err == nil && mapping != nil && mapping.ChatID != "" {
+				// Admin mappings are looked up per sender account: the same admin phone
+				// may be mapped differently (or not at all) for each account, and a
+				// campaign mapping with the same phone must never be picked up here.
+				if mapping, err := rc.repo.GetAdminChatPhoneMappingByPhone(tenantCtx, tenantID, tenantAccountID, adminNormalized, mt); err == nil && mapping != nil && mapping.ChatID != "" {
 					adminChatID = mapping.ChatID
 					adminUseChatID = true
-					log.Printf("ResultConsumer: admin chat_id found in mappings: chat_id=%s tenant=%s phone=%s", adminChatID, tenantID, adminPhone)
+					log.Printf("ResultConsumer: admin chat_id found in admin mappings: chat_id=%s tenant=%s tenant_account_id=%s phone=%s", adminChatID, tenantID, tenantAccountID, adminPhone)
 				} else if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-					log.Printf("ResultConsumer: admin chat_id lookup failed (fallback to phone) tenant=%s phone=%s: %v", tenantID, adminPhone, err)
+					log.Printf("ResultConsumer: admin chat_id lookup failed (fallback to phone) tenant=%s tenant_account_id=%s phone=%s: %v", tenantID, tenantAccountID, adminPhone, err)
 				}
 			}
 
 			// Prepare the task for this specific phone number
 			task := domain.TenantAdminNotificationTask{
-				TenantID:    tenantID.String(),
-				TenantPhone: adminPhone,
-				ChatID:      adminChatID,
-				UseChatID:   adminUseChatID,
-				Replies:     replies,
+				TenantID:        tenantID.String(),
+				TenantAccountID: tenantAccountID.String(),
+				TenantPhone:     adminPhone,
+				ChatID:          adminChatID,
+				UseChatID:       adminUseChatID,
+				Replies:         replies,
 			}
 
 			// Serialize to JSON
@@ -558,28 +668,38 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				}
 			}
 
+			// Publish to this account's OWN notification queue: the notification must
+			// be sent by the MAX account that observed the replies.
+			notifyQueue := TenantAdminNotifyQueue(tenantAccountID.String())
+			if err := rc.ensureNotifyQueue(notifyQueue); err != nil {
+				log.Printf("ResultConsumer: failed to declare notify queue %s: %v", notifyQueue, err)
+				continue
+			}
+
 			// --- Diagnostic: tenant admin notification publish (logging only) ---
-			// The notification is a separate worker task (queue
-			// tasks.messages.tenant_admin_notify), so it is traced separately
-			// from the campaign send tasks.
+			// The notification is a separate worker task published to the
+			// account-specific queue
+			// (tasks.messages.tenant_admin_notify.account.<tenant_account_id>), so it
+			// is traced separately from the campaign send tasks.
 			notifyTrace := logging.Fields(
 				"tenant_id", tenantID.String(),
+				"tenant_account_id", tenantAccountID.String(),
 				"phone", logging.MaskPhone(adminPhone),
 				"messenger_type", string(domain.DefaultMessengerType),
 				"chat_id", adminChatID,
 				"use_chat_id", adminUseChatID,
 				"reply_count", len(replies),
-				"queue", "tasks.messages.tenant_admin_notify",
+				"queue", notifyQueue,
 			)
 			logging.Info("ADMIN_NOTIFY_PUBLISH_START", notifyTrace)
 			notifyStartedAt := time.Now()
 
 			err = rc.amqpChan.PublishWithContext(
 				publishCtx,
-				"",                                   // exchange
-				"tasks.messages.tenant_admin_notify", // routing key
-				false,                                // mandatory
-				false,                                // immediate
+				"",          // exchange
+				notifyQueue, // routing key (default exchange: == queue name)
+				false,       // mandatory
+				false,       // immediate
 				amqp091.Publishing{
 					ContentType: "application/json",
 					Body:        payload,
@@ -592,7 +712,7 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 					err = rc.amqpChan.PublishWithContext(
 						publishCtx,
 						"",
-						"tasks.messages.tenant_admin_notify",
+						notifyQueue,
 						false,
 						false,
 						amqp091.Publishing{
@@ -607,7 +727,7 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 							"retried_after_reconnect", true,
 							"publish_duration_ms", time.Since(notifyStartedAt).Milliseconds()))
 					} else {
-						log.Printf("ResultConsumer: published notification to tenant %s phone %s (%d replies, chat_id=%s, use_chat_id=%v)", tenantID, adminPhone, len(replies), adminChatID, adminUseChatID)
+						log.Printf("ResultConsumer: published notification to tenant %s tenant_account_id %s phone %s (%d replies, chat_id=%s, use_chat_id=%v, queue=%s)", tenantID, tenantAccountID, adminPhone, len(replies), adminChatID, adminUseChatID, notifyQueue)
 						logging.Info("ADMIN_NOTIFY_PUBLISHED", logging.WithFields(notifyTrace,
 							"retried_after_reconnect", true,
 							"publish_duration_ms", time.Since(notifyStartedAt).Milliseconds()))
@@ -620,12 +740,25 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 						"publish_duration_ms", time.Since(notifyStartedAt).Milliseconds()))
 				}
 			} else {
-				log.Printf("ResultConsumer: published notification to tenant %s phone %s (%d replies, chat_id=%s, use_chat_id=%v)", tenantID, adminPhone, len(replies), adminChatID, adminUseChatID)
+				log.Printf("ResultConsumer: published notification to tenant %s tenant_account_id %s phone %s (%d replies, chat_id=%s, use_chat_id=%v, queue=%s)", tenantID, tenantAccountID, adminPhone, len(replies), adminChatID, adminUseChatID, notifyQueue)
 				logging.Info("ADMIN_NOTIFY_PUBLISHED", logging.WithFields(notifyTrace,
 					"publish_duration_ms", time.Since(notifyStartedAt).Milliseconds()))
 			}
 		}
 	}
+}
+
+func (rc *ResultConsumer) ensureNotifyQueue(queueName string) error {
+	if rc.amqpChan == nil {
+		return fmt.Errorf("amqp channel is nil")
+	}
+	if _, err := rc.amqpChan.QueueDeclare(queueName, true, false, false, false, nil); err != nil {
+		logging.Error("RABBITMQ_QUEUE_DECLARE_FAILED", logging.Fields(
+			"component", "result_consumer", "queue", queueName, "error", err.Error(),
+		))
+		return err
+	}
+	return nil
 }
 
 func isSendFailureResult(result domain.TargetResult) bool {

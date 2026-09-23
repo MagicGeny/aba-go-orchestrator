@@ -49,6 +49,24 @@ func AccountSendQueue(tenantAccountID string) string {
 	return "tasks.messages.send.account." + tenantAccountID
 }
 
+// TenantAdminNotifyQueuePrefix is the prefix of the per-account tenant-admin
+// notification queues: tasks.messages.tenant_admin_notify.account.<account_uuid>.
+const TenantAdminNotifyQueuePrefix = "tasks.messages.tenant_admin_notify.account."
+
+// TenantAdminNotifyQueue builds the per-account admin-notification queue name
+// from tenant_account_id (UUID). The notification is published over the default
+// exchange, so the routing key equals the queue name. Keeping one queue per
+// account is what stops the wrong MAX worker from consuming (and sending) an
+// admin notification.
+func TenantAdminNotifyQueue(tenantAccountID string) string {
+	return TenantAdminNotifyQueuePrefix + tenantAccountID
+}
+
+// LegacyTenantAdminNotifyQueue is the former shared admin-notification queue.
+// It is kept only to document the migration away from it: admin notifications
+// are never published there anymore.
+const LegacyTenantAdminNotifyQueue = "tasks.messages.tenant_admin_notify"
+
 // outboxSendTask mirrors the JSON payload produced by CampaignDoser for a send
 // task. It is used for diagnostics ONLY: the raw payload (msg.Payload) is what
 // gets published, byte for byte, so the worker contract stays untouched.

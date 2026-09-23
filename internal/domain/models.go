@@ -242,6 +242,22 @@ type ChatPhoneMapping struct {
 	UpdatedAt        time.Time `json:"updated_at"`
 }
 
+// AdminChatPhoneMapping stores the MAX chat_id of a tenant-admin phone
+// number, scoped to the sender account (tenant_accounts.id) that owns that
+// chat. It is deliberately separate from ChatPhoneMapping: the same phone may
+// simultaneously be a campaign target (chat_phone_mappings) and the tenant
+// admin phone (here), and those are different relations.
+type AdminChatPhoneMapping struct {
+	ID              uuid.UUID `json:"id"`
+	TenantID        uuid.UUID `json:"tenant_id"`
+	TenantAccountID uuid.UUID `json:"tenant_account_id"`
+	PhoneNormalized string    `json:"phone_normalized"`
+	ChatID          string    `json:"chat_id"`
+	MessengerType   string    `json:"messenger_type"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
 type TenantDailyQuota struct {
 	TenantID          uuid.UUID  `json:"tenant_id"`
 	QuotaDate         time.Time  `json:"quota_date"`
@@ -365,11 +381,15 @@ type ClientReplyInfo struct {
 }
 
 type TenantAdminNotificationTask struct {
-	TenantPhone string            `json:"tenant_phone"`
-	TenantID    string            `json:"tenant_id,omitempty"`
-	ChatID      string            `json:"chat_id,omitempty"`
-	UseChatID   bool              `json:"use_chat_id,omitempty"`
-	Replies     []ClientReplyInfo `json:"replies"`
+	TenantPhone string `json:"tenant_phone"`
+	TenantID    string `json:"tenant_id,omitempty"`
+	// TenantAccountID is the sender account (tenant_accounts.id) that must send
+	// this notification. It is required: a shared queue/worker must never send
+	// (or persist a chat mapping for) another account's notification.
+	TenantAccountID string            `json:"tenant_account_id,omitempty"`
+	ChatID          string            `json:"chat_id,omitempty"`
+	UseChatID       bool              `json:"use_chat_id,omitempty"`
+	Replies         []ClientReplyInfo `json:"replies"`
 }
 
 type CampaignRepository interface {
@@ -396,7 +416,10 @@ type CampaignRepository interface {
 	UpsertChatPhoneMapping(ctx context.Context, mapping *ChatPhoneMapping) error
 	GetChatPhoneMappingByChatID(ctx context.Context, chatID string) (*ChatPhoneMapping, error)
 	GetChatPhoneMappingByPhone(ctx context.Context, tenantID uuid.UUID, phone string, messengerType string) (*ChatPhoneMapping, error)
-	UpsertAdminChatMapping(ctx context.Context, chatID string, tenantID uuid.UUID, phone string, messengerType string) error
+	UpsertAdminChatMapping(ctx context.Context, chatID string, tenantID, tenantAccountID uuid.UUID, phone string, messengerType string) error
+	// GetAdminChatPhoneMappingByPhone always scopes the lookup to the sender
+	// account, so the same admin phone resolves independently per account.
+	GetAdminChatPhoneMappingByPhone(ctx context.Context, tenantID, tenantAccountID uuid.UUID, phone string, messengerType string) (*AdminChatPhoneMapping, error)
 	CountMappedPhones(ctx context.Context, tenantID uuid.UUID, messengerType string, phones []string) (int, error)
 	GetTenantsWithProcessingCampaigns(ctx context.Context) ([]uuid.UUID, error)
 	GetOrCreateTenantDailyQuota(ctx context.Context, tenantID uuid.UUID, quotaDate time.Time, coldMin, coldMax int) (*TenantDailyQuota, error)

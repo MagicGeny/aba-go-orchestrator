@@ -433,12 +433,13 @@ func (r *PostgresRepository) GetTenantByID(ctx context.Context, tenantID uuid.UU
 func (r *PostgresRepository) GetCampaignTargetByID(ctx context.Context, targetID uuid.UUID) (*domain.CampaignTarget, error) {
 	var t domain.CampaignTarget
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, campaign_id, client_name, phone_normalized, excel_row_index, status,
+		SELECT id, campaign_id, COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid), tenant_account_id,
+			client_name, phone_normalized, excel_row_index, status,
 			last_error, sent_at, replied_at, last_reply_text, created_at, updated_at, COALESCE(messenger_type, 'MAX')
 		FROM campaign_targets
 		WHERE id = $1
 	`, targetID).Scan(
-		&t.ID, &t.CampaignID, &t.ClientName, &t.PhoneNormalized, &t.ExcelRowIndex,
+		&t.ID, &t.CampaignID, &t.TenantID, &t.TenantAccountID, &t.ClientName, &t.PhoneNormalized, &t.ExcelRowIndex,
 		&t.Status, &t.LastError, &t.SentAt, &t.RepliedAt, &t.LastReplyText, &t.CreatedAt, &t.UpdatedAt, &t.MessengerType,
 	)
 	if err != nil {
@@ -763,14 +764,58 @@ func (r *PostgresRepository) GetChatPhoneMappingByPhone(ctx context.Context, ten
 	return &m, nil
 }
 
-// UpsertAdminChatMapping stores the chat_id for an admin (or any "direct" recipient)
-// that has neither a campaign_id nor a campaign_target_id. It does not perform joins on campaigns/targets,
-// unlike UpsertChatPhoneMapping. It is used for the first and subsequent
-// successful outgoing notifications to the tenant's admin.
-func (r *PostgresRepository) UpsertAdminChatMapping(ctx context.Context, chatID string, tenantID uuid.UUID, phone string, messengerType string) error {
+// GetAdminChatPhoneMappingByPhone looks up a saved admin chat_id by
+// (tenant_id, tenant_account_id, phone, messenger_type). The sender account is
+// part of the key on purpose: MAX chats belong to one account, so the same admin
+// phone can be mapped independently (and differently) for every account of the
+// tenant. Campaign/customer lookups keep using GetChatPhoneMappingByPhone.
+func (r *PostgresRepository) GetAdminChatPhoneMappingByPhone(ctx context.Context, tenantID, tenantAccountID uuid.UUID, phone string, messengerType string) (*domain.AdminChatPhoneMapping, error) {
+	if strings.TrimSpace(phone) == "" {
+		return nil, pgx.ErrNoRows
+	}
+	if tenantAccountID == uuid.Nil {
+		return nil, fmt.Errorf("admin chat mapping lookup: tenant_account_id is empty")
+	}
+	mt := strings.TrimSpace(messengerType)
+	if mt == "" {
+		mt = "MAX"
+	}
+	var m domain.AdminChatPhoneMapping
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, tenant_id, tenant_account_id, phone_normalized, chat_id,
+			COALESCE(messenger_type, 'MAX'), created_at, updated_at
+		FROM admin_chat_phone_mappings
+		WHERE tenant_id = $1
+		  AND tenant_account_id = $2
+		  AND phone_normalized = $3
+		  AND messenger_type = $4
+	`, tenantID, tenantAccountID, phone, mt).Scan(
+		&m.ID, &m.TenantID, &m.TenantAccountID, &m.PhoneNormalized, &m.ChatID, &m.MessengerType, &m.CreatedAt, &m.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// UpsertAdminChatMapping stores the chat_id of a tenant-admin phone in
+// admin_chat_phone_mappings, scoped to the sender account (tenant_accounts.id)
+// that actually owns that MAX chat.
+//
+// It never touches chat_phone_mappings (campaign/customer mappings keep their own
+// semantics) and it never guesses the account: an empty tenant_account_id is an
+// error, so there is no ORDER BY created_at LIMIT 1 fallback and no arbitrary
+// account can be associated with an admin chat.
+func (r *PostgresRepository) UpsertAdminChatMapping(ctx context.Context, chatID string, tenantID, tenantAccountID uuid.UUID, phone string, messengerType string) error {
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
 		return fmt.Errorf("chat_id is empty")
+	}
+	if tenantID == uuid.Nil {
+		return fmt.Errorf("tenant_id is empty")
+	}
+	if tenantAccountID == uuid.Nil {
+		return fmt.Errorf("tenant_account_id is empty")
 	}
 	mt := strings.TrimSpace(messengerType)
 	if mt == "" {
@@ -786,33 +831,15 @@ func (r *PostgresRepository) UpsertAdminChatMapping(ctx context.Context, chatID 
 	}
 	now := time.Now().UTC()
 	_, err = r.pool.Exec(ctx, `
-		INSERT INTO chat_phone_mappings (id, chat_id, campaign_id, campaign_target_id, phone_normalized, viewer_id, created_at, updated_at, tenant_id, messenger_type, tenant_account_id)
-		VALUES ($1, $2, NULL, NULL, $3, NULL, $4, $4, $5, $6, (
-			SELECT ta.id FROM tenant_accounts ta
-			WHERE ta.tenant_id = $5
-			ORDER BY ta.created_at ASC, ta.id ASC
-			LIMIT 1
-		))
-		ON CONFLICT (chat_id) DO UPDATE
-		SET phone_normalized = EXCLUDED.phone_normalized,
-			tenant_id        = EXCLUDED.tenant_id,
-			messenger_type   = EXCLUDED.messenger_type,
-			tenant_account_id = COALESCE(chat_phone_mappings.tenant_account_id, EXCLUDED.tenant_account_id),
-			updated_at       = EXCLUDED.updated_at
-	`, id, chatID, phone, now, tenantID, mt)
+		INSERT INTO admin_chat_phone_mappings (id, tenant_id, tenant_account_id, phone_normalized, chat_id, messenger_type, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+		ON CONFLICT (tenant_account_id, phone_normalized, messenger_type) DO UPDATE
+		SET chat_id    = EXCLUDED.chat_id,
+			tenant_id  = EXCLUDED.tenant_id,
+			updated_at = EXCLUDED.updated_at
+	`, id, tenantID, tenantAccountID, phone, chatID, mt, now)
 	if err != nil {
-		// Fallback: UPDATE существующей записи по (tenant_id, phone, messenger_type)
-		_, err2 := r.pool.Exec(ctx, `
-			UPDATE chat_phone_mappings m
-			SET chat_id = $1,
-				updated_at = $2
-			WHERE m.tenant_id = $3
-			  AND m.phone_normalized = $4
-			  AND m.messenger_type = $5
-		`, chatID, now, tenantID, phone, mt)
-		if err2 != nil {
-			return fmt.Errorf("upsert admin chat mapping: %w (fallback: %v)", err, err2)
-		}
+		return fmt.Errorf("upsert admin chat mapping: %w", err)
 	}
 	return nil
 }
