@@ -811,9 +811,11 @@ func (r *PostgresRepository) UpsertAdminChatMapping(ctx context.Context, chatID 
 	if chatID == "" {
 		return fmt.Errorf("chat_id is empty")
 	}
-	if tenantID == uuid.Nil {
-		return fmt.Errorf("tenant_id is empty")
-	}
+	// NOTE: uuid.Nil must not be treated as "tenant is missing": a tenant row may
+	// legitimately have the nil UUID (the seeded tenant in this deployment is
+	// 00000000-0000-0000-0000-000000000000). The FK on tenant_id still rejects
+	// unknown tenants. The sender account, however, is mandatory and still
+	// prevents any arbitrary-account fallback.
 	if tenantAccountID == uuid.Nil {
 		return fmt.Errorf("tenant_account_id is empty")
 	}

@@ -80,6 +80,21 @@ func resultAccountID(result domain.TargetResult) uuid.UUID {
 	return uuid.Nil
 }
 
+// isAdminNotificationResult reports whether a worker result is a tenant-admin
+// notification send rather than a campaign send. An admin notification has no
+// campaign target, so the absence of target_id/campaign_id is the discriminator;
+// the sender account (tenant_account_id) is validated separately.
+//
+// NOTE: uuid.Nil must NOT be used here to mean "tenant is missing". A tenant row
+// may legitimately have the nil UUID (the seeded tenant in this deployment is
+// 00000000-0000-0000-0000-000000000000), and treating that as absent was exactly
+// why the admin chat mapping was never persisted.
+func isAdminNotificationResult(result domain.TargetResult) bool {
+	return result.Status == domain.TaskStatusSent &&
+		result.TargetID == uuid.Nil &&
+		result.CampaignID == uuid.Nil
+}
+
 // resultTrace builds the correlation identifier set used by the worker-result
 // diagnostics. It mirrors the identifiers used when the task was published
 // (WORKER_TASK_PUBLISH_*) so a single target can be followed end to end.
@@ -368,7 +383,7 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				if err != nil {
 					log.Printf("ResultConsumer: failed to upsert chat mapping for target %s chat_id=%s: %v", result.TargetID, result.ChatID, err)
 				}
-			} else if result.Status == domain.TaskStatusSent && result.TenantID != uuid.Nil && strings.TrimSpace(result.PhoneNumber) != "" {
+			} else if isAdminNotificationResult(result) && strings.TrimSpace(result.PhoneNumber) != "" {
 				// Admin notification result: TargetID/CampaignID are empty, but we know
 				// the tenant, the phone number and (reported by the worker) the sender
 				// account. Persist the chat_id in admin_chat_phone_mappings — a table
@@ -436,7 +451,7 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 			}
 		}
 
-		if result.Status == domain.TaskStatusSent && result.TenantID != uuid.Nil && result.TargetID == uuid.Nil && result.CampaignID == uuid.Nil {
+		if isAdminNotificationResult(result) {
 			// Admin-notification send result: recorded as a chat mapping above,
 			// there is no campaign target to transition.
 			logging.Info("WORKER_RESULT_REJECTED", logging.WithFields(trace,
