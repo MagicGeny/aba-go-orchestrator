@@ -514,8 +514,14 @@ func (rc *ResultConsumer) flush(ctx context.Context) {
 				goto finish
 			}
 
-			if strings.TrimSpace(*result.ReplyText) == "@" && rc.blocklist != nil {
+			if rc.cfg.IsUnsubscribeReply(*result.ReplyText) && rc.blocklist != nil {
 				rc.blocklist.Add(campaign.TenantID, target.PhoneNormalized)
+				log.Printf("ResultConsumer: UNSUBSCRIBE_DETECTED tenant=%s target=%s campaign=%s", campaign.TenantID, result.TargetID, result.CampaignID)
+				logging.Info("UNSUBSCRIBE_DETECTED", logging.WithFields(trace,
+					"tenant_id", campaign.TenantID.String(),
+					"target_id", result.TargetID.String(),
+					"campaign_id", result.CampaignID.String(),
+				))
 			}
 
 			// Preserve the sender-account provenance of the reply: only the account

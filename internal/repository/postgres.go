@@ -16,10 +16,27 @@ import (
 
 type PostgresRepository struct {
 	pool *pgxpool.Pool
+	// isUnsubscribe reports whether a reply text means "unsubscribe".
+	// Nil preserves the legacy hardcoded "@" check.
+	isUnsubscribe func(string) bool
 }
 
 func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 	return &PostgresRepository{pool: pool}
+}
+
+// SetUnsubscribeMatcher installs the configurable unsubscribe matcher.
+// It keeps RegisterReply's persistent blocklist insert in parity with the
+// in-memory blocklist update in the result consumer.
+func (r *PostgresRepository) SetUnsubscribeMatcher(fn func(string) bool) {
+	r.isUnsubscribe = fn
+}
+
+func (r *PostgresRepository) isUnsubscribeReply(text string) bool {
+	if r.isUnsubscribe != nil {
+		return r.isUnsubscribe(text)
+	}
+	return strings.TrimSpace(text) == "@"
 }
 
 func (r *PostgresRepository) CreateCampaign(ctx context.Context, campaign *domain.Campaign, targets []*domain.CampaignTarget, outbox []*domain.OutboxMessage) error {
@@ -568,7 +585,7 @@ func (r *PostgresRepository) RegisterReply(ctx context.Context, campaignID uuid.
 		return nil, err
 	}
 
-	if strings.TrimSpace(text) == "@" {
+	if r.isUnsubscribeReply(text) {
 		now := time.Now().UTC()
 		_, err = tx.Exec(ctx, `
 			INSERT INTO tenant_blocked_recipients (tenant_id, phone_normalized, blocked_at, updated_at)

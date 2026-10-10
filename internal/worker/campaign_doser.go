@@ -15,6 +15,7 @@ import (
 	"github.com/MagicGeny/aba-go-orchestrator/internal/config"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/domain"
 	"github.com/MagicGeny/aba-go-orchestrator/internal/logging"
+	"github.com/MagicGeny/aba-go-orchestrator/internal/spintax"
 	"github.com/google/uuid"
 )
 
@@ -175,6 +176,7 @@ func (d *CampaignDoser) scheduleTarget(ctx context.Context, target *domain.Pendi
 	}
 
 	messageText := strings.ReplaceAll(target.MessageTemplate, "{user_name}", CapitalizeText(target.ClientName))
+	messageText = spintax.Expand(messageText)
 	contactType := "warm"
 	useChatID := target.IsWarm && target.ChatID != ""
 	if isCold {

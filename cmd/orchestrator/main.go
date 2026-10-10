@@ -152,6 +152,7 @@ func main() {
 	}
 
 	cfg := config.LoadFromEnv()
+	repo.SetUnsubscribeMatcher(cfg.IsUnsubscribeReply)
 	warnMissingTenantBaseline(ctx, pool)
 	campaignUC := usecase.NewCampaignUseCase(repo, attachmentStore, cfg)
 	hub := transport.NewHub()

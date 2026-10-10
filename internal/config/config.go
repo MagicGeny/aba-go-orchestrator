@@ -32,6 +32,10 @@ type Config struct {
 	RetryDelayMinutes      int
 	AccountCooldownMinutes int
 	RabbitMQSendExchange   string
+	// UnsubscribeVariants holds the raw configured exact-match reply texts
+	// that mean "unsubscribe". UnsubscribeSet holds the normalized forms.
+	UnsubscribeVariants []string
+	UnsubscribeSet      map[string]struct{}
 }
 
 func LoadFromEnv() Config {
@@ -53,7 +57,9 @@ func LoadFromEnv() Config {
 		RetryDelayMinutes:      envInt("RETRY_DELAY_MINUTES", 15),
 		AccountCooldownMinutes: envInt("ACCOUNT_COOLDOWN_MINUTES", 60),
 		RabbitMQSendExchange:   envString("RABBITMQ_SEND_EXCHANGE", "tasks.messages.direct"),
+		UnsubscribeVariants:    parseUnsubscribeVariants(os.Getenv("UNSUBSCRIBE_VARIANTS")),
 	}
+	cfg.UnsubscribeSet = buildUnsubscribeSet(cfg.UnsubscribeVariants)
 	parseWorkWindow(&cfg)
 	log.Printf("config: timezone=%s work_window=%s-%s cold_interval=%d-%d min warm_interval=%d-%d min",
 		cfg.Location.String(), cfg.WorkWindowStart, cfg.WorkWindowEnd,
@@ -119,6 +125,52 @@ func (c Config) NextDayWorkStart(now time.Time) time.Time {
 		start = start.AddDate(0, 0, 1)
 	}
 	return start.UTC()
+}
+
+// IsUnsubscribeReply reports whether text is an exact configured
+// unsubscribe reply after normalization (trim, lowercase, collapse inner
+// whitespace). Matching is exact: no substring or fuzzy matching.
+func (c Config) IsUnsubscribeReply(text string) bool {
+	if len(c.UnsubscribeSet) == 0 {
+		return normalizeUnsubscribe(text) == normalizeUnsubscribe("@")
+	}
+	_, ok := c.UnsubscribeSet[normalizeUnsubscribe(text)]
+	return ok
+}
+
+// parseUnsubscribeVariants splits a semicolon-separated UNSUBSCRIBE_VARIANTS
+// value. Semicolons are used because phrases may contain commas.
+// Missing or empty input defaults to ["@"] for backward compatibility.
+func parseUnsubscribeVariants(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ";") {
+		if v := strings.TrimSpace(part); v != "" {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"@"}
+	}
+	return out
+}
+
+func buildUnsubscribeSet(variants []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(variants))
+	for _, v := range variants {
+		if n := normalizeUnsubscribe(v); n != "" {
+			set[n] = struct{}{}
+		}
+	}
+	if len(set) == 0 {
+		set[normalizeUnsubscribe("@")] = struct{}{}
+	}
+	return set
+}
+
+// normalizeUnsubscribe trims, lowercases, and collapses repeated inner
+// whitespace so " НЕТ " and "не   надо" match their configured variants.
+func normalizeUnsubscribe(s string) string {
+	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(s))), " ")
 }
 
 func envString(key, fallback string) string {
