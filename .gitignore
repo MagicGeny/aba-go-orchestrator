@@ -2,3 +2,4 @@
 /orchestrator
 .env
 /logs/
+.idea/
